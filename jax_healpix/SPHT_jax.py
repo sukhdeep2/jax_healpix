@@ -28,7 +28,7 @@ from jax import jit
 
 from YLM_jax import *
 
-RING_ITER_SIZE = 128  # FIXME: User should have some control over this.
+RING_ITER_SIZE = 64  # FIXME: User should have some control over this.
 
 
 def ring_beta(nside):
@@ -92,6 +92,7 @@ def fft_phi_m(nside, l_max, ring_i, phase):
     return fft_phi, beta
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2))
 def north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, phi_phase):
     ring_i = jnp.arange(128) + ring_i0 * 128 + 1
     # ring_i = jnp.where(ring_i > 2 * nside, 0, ring_i)
@@ -108,6 +109,7 @@ def north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, phi_phase):
     return ring_i, ylm, fft_phi
 
 
+@partial(jax.jit, static_argnums=(0, 1))
 def south_ring_ylm(nside, l_max, ring_i, ylm):
     l = jnp.arange(l_max + 1)
     for s in ylm.keys():
@@ -124,25 +126,49 @@ def south_ring_ylm(nside, l_max, ring_i, ylm):
     return ring_i, ylm
 
 
-# @partial(jax.jit, static_argnums=(0,1,2))
+def Gmy(maps, fft_phi):  # tj,jm->tm
+    return maps @ fft_phi
+
+
+v_Gmy = jax.vmap(Gmy, in_axes=(1, 0))  # return shape: rtm
+
+
+def Gmy2alm(Gmy, ylm):  # rtm,lmr ... rt,lr
+    return ylm @ Gmy
+
+
+v_Gmy2alm = jax.vmap(Gmy2alm, in_axes=(2, 1))  # return shape mlt
+
+
+@jit
+def ring2alm_ns(ring_i, ylm, maps, fft_phi, alm):  # north or south
+    for s in maps.keys():
+        # alm_t = jnp.einsum(  #
+        #     "trj,rjm,lmr->tlm",
+        #     maps[s][:, ring_i - 1, :],
+        #     fft_phi,
+        #     ylm[s],  # [:, :, ring_i - 1],
+        # )
+        # Gmy = v_Gmy(maps[s][:, ring_i - 1, :], fft_phi)
+        alm_t = v_Gmy2alm(v_Gmy(maps[s][:, ring_i - 1, :], fft_phi), ylm[s])
+        alm_t = alm_t.transpose(2, 1, 0)
+        alm[s] = alm[s].at[:, :, :].add(alm_t)
+        del alm_t
+    return alm
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2))
 def ring2alm(nside, l_max, spin_max, maps, beta, ring_i0, alm):
     """
     Computes alm for a given ring and add to the alm vector.
     """
     # ring_i = jnp.atleast_1d(ring_i)
-    ring_i, ylm, fft_phi = north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, -1)
 
-    for _ in range(2):  # to get both north and south sides
-        for s in maps.keys():
-            alm_t = jnp.einsum(
-                "trj,rjm,lmr->tlm",
-                maps[s][:, ring_i - 1, :],
-                fft_phi,
-                ylm[s],  # [:, :, ring_i - 1],
-            )
-            alm[s] = alm[s].at[:, :, :].add(alm_t)
-        ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
-        # alm[s] = alm_t
+    ring_i, ylm, fft_phi = north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, -1)
+    alm = ring2alm_ns(ring_i, ylm, maps, fft_phi, alm)
+
+    ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
+    alm = ring2alm_ns(ring_i, ylm, maps, fft_phi, alm)
 
     return alm
 
@@ -161,6 +187,11 @@ def map2alm(nside, l_max, spin_max, maps):
 
     niter = max(1, (2 * nside) // RING_ITER_SIZE)
     alm = jax.lax.fori_loop(0, niter, ring2alm_i, alm)
+    # FIXME: loop is costly, needed to lower the peak memory usage inside ring2alm
+
+    # for i in range(niter):
+    #     alm = ring2alm(nside, l_max, spin_max, maps, beta, i, alm)
+
     # alm = ring2alm_i(jnp.arange(1, 4 * nside), alm)
 
     for s in maps.keys():
@@ -168,17 +199,17 @@ def map2alm(nside, l_max, spin_max, maps):
     return alm
 
 
-# @partial(jax.jit, static_argnums=(0, 1, 2))
+@partial(jax.jit, static_argnums=(0, 1, 2))
 def map2alm_iteration(nside, l_max, spin_max, maps, iteration, alm):
     map_t = alm2map(nside, l_max, spin_max, alm)
-    diff_map = {s: maps[s] - map_t[s] for s in maps.keys()}  # FIXME
+    diff_map = {s: maps[s] - map_t[s] for s in maps.keys()}
     alm_diff = map2alm(nside, l_max, spin_max, diff_map)
     for s in maps.keys():
         alm[s] = alm[s].at[:].add(alm_diff[s])
     return alm
 
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+# @partial(jax.jit, static_argnums=(0, 1, 2))
 def map2alm_iter(nside, l_max, spin_max, niter, maps):
     """
     https://healpix.sourceforge.io/html/sub_map2alm_iterative.htm
@@ -187,39 +218,71 @@ def map2alm_iter(nside, l_max, spin_max, niter, maps):
     alm = map2alm(nside, l_max, spin_max, maps)
     map2alm_i = jax.tree_util.Partial(map2alm_iteration, nside, l_max, spin_max, maps)
     alm = jax.lax.fori_loop(0, niter, map2alm_i, alm)
-    # for i in range(1, niter):
+    # for i in range(0, niter):
     #     # alm = map2alm_i(i, alm)
     #     alm = map2alm_iteration(nside, l_max, spin_max, maps, i, alm)
     return alm
 
 
-# @partial(jax.jit, static_argnums=(0, 1))
-def alm2ring(nside, l_max, spin_max, alm, beta, ring_i0, maps):
+@jit
+def Fmy(alm, ylm):  # loop over m
+    return alm @ ylm
 
-    ring_i, ylm, fft_phi = north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, 1)
 
-    for _ in range(2):  # to get both north and south sides
-        for s in alm.keys():
-            mt = jnp.einsum("tlm,lmr,rjm->trj", alm[s], ylm[s], fft_phi)
-            maps[s] = maps[s].at[:, ring_i - 1, :].add(mt)
+v_Fmy = jax.vmap(Fmy, in_axes=(2, 1))
 
-        ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
+
+def Fmy2map(Fmy, fft_phi):  # loop over r
+    return fft_phi @ Fmy
+
+
+v_Fmy2map = jax.vmap(Fmy2map, in_axes=(2, 0))
+
+
+@jit
+def alm2ring_ns(ring_i, ylm, alm, fft_phi, maps):
+    for s in alm.keys():
+        # mt = jnp.einsum("tlm,lmr,rjm->trj", alm[s], ylm[s], fft_phi)
+        # Fmy = v_Fmy(alm[s], ylm[s])  # mtr
+        mt = v_Fmy2map(v_Fmy(alm[s], ylm[s]), fft_phi)  # rjt
+        mt = mt.transpose(2, 0, 1)  # trj
+        maps[s] = maps[s].at[:, ring_i - 1, :].add(mt)
+        del mt
     return maps
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
+def alm2ring(nside, l_max, spin_max, alm, beta, ring_i0, maps):
+
+    ring_i, ylm, fft_phi = north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, 1)
+    maps = alm2ring_ns(ring_i, ylm, alm, fft_phi, maps)
+
+    ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
+    maps = alm2ring_ns(ring_i, ylm, alm, fft_phi, maps)
+
+    return maps
+
+
+# @partial(jax.jit, static_argnums=(0, 1, 2))
 def alm2map(nside, l_max, spin_max, alm):
-    spins = jnp.arange(spin_max + 1, step=2)
+
     for s in alm.keys():
-        alm[s] = alm[s].at[:, :, 1:].multiply(2)
+        alm[s] = alm[s].at[:, :, 1:].multiply(2)  # to correct for missing m<0
     maps = {s: jnp.zeros((len(alm[s]), 4 * nside - 1, 4 * nside)) for s in alm.keys()}
     beta = ring_beta(nside)
-    # ylm = sYLM_recur(l_max=l_max, spin_max=spin_max, beta=betas)
 
-    alm2ring_i = jax.tree_util.Partial(alm2ring, nside, l_max, spin_max, alm, beta)
     niter = max(1, (2 * nside) // RING_ITER_SIZE)
+    # FIXME: loop is costly, needed to lower the peak memory usage inside alm2ring
+    alm2ring_i = jax.tree_util.Partial(alm2ring, nside, l_max, spin_max, alm, beta)
     maps = jax.lax.fori_loop(0, niter, alm2ring_i, maps)
+
+    # for i in range(niter):
+    #     maps = alm2ring(nside, l_max, spin_max, alm, beta, i, maps)
     # maps = alm2ring_i(jnp.arange(1, 4 * nside), maps)
+
+    for s in alm.keys():
+        alm[s] = alm[s].at[:, :, 1:].divide(2)  # undo multiplication above
+
     return maps
 
 
