@@ -16,7 +16,9 @@ https://iopscience.iop.org/article/10.1088/0067-0049/190/2/267/pdf
 https://arxiv.org/pdf/0904.2517.pdf (alternate pixelization)
 """
 
-from functools import partial
+# from functools import partial
+from jax.tree_util import Partial as partial
+
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +27,7 @@ from utils import *
 
 
 @partial(jax.jit, static_argnums=(0))
-def sYLM_ll0(l_max, beta, beta_s, l, ylm):
+def sYLM_ll0(l_max, beta, beta_s, ylm):
     """
     Computes spin-0 Ylm for l=m. Eq. 15 of ref 1.
     There are two implementations, first one uses the l-1 Ylm which is already computed.
@@ -39,17 +41,26 @@ def sYLM_ll0(l_max, beta, beta_s, l, ylm):
     # ylm[0] = ylm[0].at[l, l, :].add(pre_fact * ylm[0][l - 1, l - 1, :] * beta_s)
 
     l_arr = jnp.arange(l_max) + 1
-    log_prefact = jnp.sum(jnp.where(l_arr <= l, jnp.log(2 * l_arr + 1), 0))
-    log_prefact -= jnp.sum(jnp.where(l_arr <= l, jnp.log(2 * l_arr), 0))
+    # log_prefact = jnp.sum(jnp.where(l_arr <= l, jnp.log(2 * l_arr + 1), 0))
+    # log_prefact -= jnp.sum(jnp.where(l_arr <= l, jnp.log(2 * l_arr), 0))
+    log_prefact = jnp.cumsum(jnp.log(2 * l_arr + 1), 0)
+    log_prefact -= jnp.cumsum(jnp.log(2 * l_arr), 0)
+
     log_prefact *= 0.5
-    log_yll = jnp.log(beta_s) * l + log_prefact  # FIXME: pass log_beta_s
-    yll = ((-1) ** l) * jnp.exp(log_yll)
-    ylm[0] = ylm[0].at[l, l, :].set(yll)
+    log_yll = (
+        jnp.log(beta_s[None, :]) * l_arr[:, None] + log_prefact[:, None]
+    )  # FIXME: pass log_beta_s
+    yll = ((-1) ** l_arr[:, None]) * jnp.exp(log_yll)
+    ylm[0] = ylm[0].at[l_arr, l_arr, :].set(yll)
 
     ylm[0] = (
         ylm[0]
-        .at[l, l - 1, :]
-        .set(ylm[0][l - 1, l - 1, :] * beta * jnp.sqrt(2 * (l - 1) + 3))
+        .at[l_arr, l_arr - 1, :]
+        .set(
+            ylm[0][l_arr - 1, l_arr - 1, :]
+            * beta[None, :]
+            * jnp.sqrt(2 * (l_arr[:, None] - 1) + 3)
+        )
     )
     return ylm  # ,None
 
@@ -160,7 +171,8 @@ def sYLM_recur(l_max, spin_max, beta):
         beta_s,
     )
 
-    ylm = jax.lax.fori_loop(1, l_max + 1, sYLM_ll0_i, ylm)
+    # ylm = jax.lax.fori_loop(1, l_max + 1, sYLM_ll0_i, ylm)
+    ylm = sYLM_ll0_i(ylm)
 
     sYLM_l0_i = jax.tree_util.Partial(  # partial(
         sYLM_l0,
