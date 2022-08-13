@@ -26,7 +26,8 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 
-from YLM_jax import *
+# from YLM_jax import *
+from YLM_jax_log import *
 
 RING_ITER_SIZE = 32  # FIXME: User should have some control over this.
 
@@ -99,7 +100,7 @@ def north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, phi_phase):
     beta = jnp.where(ring_i <= 2 * nside, beta[ring_i - 1], 0)
 
     fft_phi, _ = fft_phi_m(nside, l_max, ring_i, phi_phase)
-    ylm = sYLM_recur(l_max=l_max, spin_max=spin_max, beta=beta)
+    ylm = sYLM_recur_log(l_max=l_max, spin_max=spin_max, beta=beta)
 
     for s in ylm.keys():
         ylm[s] = jnp.where(
@@ -180,7 +181,7 @@ def map2alm(nside, l_max, spin_max, maps):
         for s in maps.keys()
     }
     beta = ring_beta(nside)
-    # ylm = sYLM_recur(l_max=l_max, spin_max=spin_max, beta=beta)
+    # ylm = sYLM_recur_log(l_max=l_max, spin_max=spin_max, beta=beta)
     ring2alm_i = jax.tree_util.Partial(ring2alm, nside, l_max, spin_max, maps, beta)
 
     pix_area = 4 * jnp.pi / 12 / nside**2
