@@ -99,16 +99,16 @@ def sYLM_l0(l_max, beta, beta_s, l, ylm):
     """
     m = jnp.arange(l_max + 1)
 
-    # log_Alm = log_A_lm(l, m)
-    # log_Alm_prev = log_A_lm(l - 1, m)
-    # Blm = jnp.where(l - 1 > m, jnp.exp(log_Alm - log_Alm_prev), 0)
-    # Alm = jnp.where(l > m, jnp.exp(log_Alm), 0)
+    log_Alm = log_A_lm(l, m)
+    log_Alm_prev = log_A_lm(l - 1, m)
+    Blm = jnp.where(l - 1 > m, jnp.exp(log_Alm - log_Alm_prev), 0)
+    Alm = jnp.where(l - 1 > m, jnp.exp(log_Alm), 0)
 
-    Alm = A_lm(l, m)
-    Alm_prev = A_lm(l - 1, m)
+    # Alm = A_lm(l, m)
+    # Alm_prev = A_lm(l - 1, m)
 
-    Blm = jnp.where(l - 1 > m, Alm / Alm_prev, 0)
-    Alm = jnp.where(l - 1 > m, Alm, 0)
+    # Blm = jnp.where(l - 1 > m, Alm / Alm_prev, 0)
+    # Alm = jnp.where(l - 1 > m, Alm, 0)
 
     ylm[0] = ylm[0].at[l, :, :].add(beta[None, :] * Alm[:, None] * ylm[0][l - 1, :, :])
     ylm[0] = ylm[0].at[l, :, :].add(-Blm[:, None] * ylm[0][l - 2, :, :])

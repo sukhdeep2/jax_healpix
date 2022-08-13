@@ -14,6 +14,7 @@ def logdiffexp(log_a, log_b):  # assume a>b
     return log_diff
 
 
+# https://stackoverflow.com/questions/2350072/custom-data-types-in-numpy-arrays
 def logsumexp(log_A, log_B, sign_A, sign_B):
     """
     compute log(a +/- b), using log_a and log_b and the signs of a and b

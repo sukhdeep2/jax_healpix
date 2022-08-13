@@ -28,7 +28,7 @@ from jax import jit
 
 from YLM_jax import *
 
-RING_ITER_SIZE = 64  # FIXME: User should have some control over this.
+RING_ITER_SIZE = 32  # FIXME: User should have some control over this.
 
 
 def ring_beta(nside):
@@ -94,7 +94,7 @@ def fft_phi_m(nside, l_max, ring_i, phase):
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def north_ring_ylm(nside, l_max, spin_max, beta, ring_i0, phi_phase):
-    ring_i = jnp.arange(128) + ring_i0 * 128 + 1
+    ring_i = jnp.arange(RING_ITER_SIZE) + ring_i0 * RING_ITER_SIZE + 1
     # ring_i = jnp.where(ring_i > 2 * nside, 0, ring_i)
     beta = jnp.where(ring_i <= 2 * nside, beta[ring_i - 1], 0)
 
