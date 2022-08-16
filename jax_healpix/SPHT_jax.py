@@ -17,13 +17,15 @@ https://arxiv.org/pdf/1303.4945.pdf
 https://arxiv.org/pdf/1804.10382.pdf
 """
 
-from skylens.wigner_transform import *
+# from skylens.wigner_transform import *
 
 from functools import partial
 
 from YLM_jax_log import *
 
-RING_ITER_SIZE = 256  # FIXME: User should have some control over this.
+RING_ITER_SIZE = 32  # FIXME: User should have some control over this.
+
+import time
 
 
 def ring_beta(nside):
@@ -99,32 +101,40 @@ def phi_m(nside, l_max, ring_i, phase):
     """
     return e^(im\phi) for all pixels in a given ring.
     """
+
     phi_0, npix, beta = np.where(
         np.logical_or(ring_i < nside, ring_i > 3 * nside),
         ring_pol(nside, ring_i),
         ring_eq(nside, ring_i),
     )
+
     m = np.arange(l_max + 1)
     x = np.arange(4 * nside)
     # phi = np.where(x < npix, phi_0 + 2 * np.pi * x / npix, 0)
     phi = (
         phi_0[:, None] + 2 * np.pi * x[None, :] / npix[:, None]
     )  # x>=npix nulled below
-    phi = np.exp(1j * phase * m[None, None, :] * phi[:, :, None])
-    j_pix = x
-    phi = np.where(
-        j_pix[None, :, None] < npix[:, None, None], phi, 0
-    )  # no data for # x>=npix in a ring
+
+    phi = np.exp(phase * 1j * m[None, None, :] * phi[:, :, None])
+
+    xx = x[None, :] >= npix[:, None]
+    phi[xx, :] *= 0
+    # phi = np.where(
+    #     j_pix[None, :, None] < npix[:, None, None], phi, 0
+    # )  # no data for # x>=npix in a ring
+
     return phi, beta
 
 
 def north_ring_ylm(nside, l_max, spins, log_beta, ring_i0, phi_phase):
+
     iter_size = min(RING_ITER_SIZE, 2 * nside)
     ring_i = np.arange(iter_size) + ring_i0 * iter_size + 1
     # ring_i = np.where(ring_i > 2 * nside, 0, ring_i)
     log_beta = np.where(ring_i <= 2 * nside, log_beta[ring_i - 1], 0)
 
     phi, _ = phi_m(nside, l_max, ring_i, phi_phase)
+
     ylm = sYLM_recur_log(l_max=l_max, spins=spins, log_beta=log_beta)
 
     for s in ylm.keys():
@@ -149,28 +159,23 @@ def south_ring_ylm(nside, l_max, ring_i, ylm):
     return ring_i, ylm
 
 
-def Gmy(maps, phi):  # tj,jm->tm
-    return maps @ phi
+def Gmy(maps, phi):  # trj,rjm->trm
+    return np.sum(maps[:, :, :, None] * phi[None, :, :, :], axis=-2)
 
 
-v_Gmy = np.vectorize(Gmy)  # , in_axes=(1, 0))  # return shape: rtm
-
-
-def Gmy2alm(Gmy, ylm):  # rtm,lmr ... rt,lr
-    return ylm @ Gmy
-
-
-v_Gmy2alm = np.vectorize(Gmy2alm)  # , in_axes=(2, 1))  # return shape mlt
+def Gmy2alm(Gmy, ylm):  # trm,lmr ... tlm
+    return np.sum(Gmy[:, None, :, :] * ylm.transpose(0, 2, 1)[None, :, :, :], axis=-2)
 
 
 def ring2alm_ns_dot(ring_i, maps, phi, ylm):
-    alm_t = np.einsum(  #
-        "trj,rjm,lmr->tlm",
-        maps[:, ring_i - 1, :],
-        phi,
-        ylm,  # [:, :, ring_i - 1],
-    )
-    # Gmy = v_Gmy(maps[s][:, ring_i - 1, :], phi)
+    alm_t = Gmy2alm(Gmy(maps[:, ring_i - 1, :], phi), ylm)
+
+    # alm_t = np.einsum(  #
+    #     "trj,rjm,lmr->tlm",
+    #     maps[:, ring_i - 1, :],
+    #     phi,
+    #     ylm,  # [:, :, ring_i - 1],
+    # )
 
     # alm_t = v_Gmy2alm(v_Gmy(maps[:, ring_i - 1, :], phi), ylm).transpose(2, 1, 0)
     # alm_t = alm_t.transpose(2, 1, 0)
@@ -178,6 +183,7 @@ def ring2alm_ns_dot(ring_i, maps, phi, ylm):
 
 
 def ring2alm_ns(spins, ring_i, ylm, maps, phi, alm):  # north or south
+
     if 0 in spins:
         s = 0
         alm[s] += ring2alm_ns_dot(ring_i, maps[s], phi, ylm[s])
@@ -204,17 +210,19 @@ def ring2alm(nside, l_max, spins, maps, log_beta, ring_i0, alm):
     Computes alm for a given ring and add to the alm vector.
     """
     # ring_i = np.atleast_1d(ring_i)
-
     ring_i, ylm, phi = north_ring_ylm(nside, l_max, spins, log_beta, ring_i0, -1)
+
     alm = ring2alm_ns(spins, ring_i, ylm, maps, phi, alm)
 
     ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
+
     alm = ring2alm_ns(spins, ring_i, ylm, maps, phi, alm)
 
     return alm
 
 
 def map2alm(nside, l_max, spins, maps):
+
     alm = {
         s: np.zeros((maps[s].shape[0], l_max + 1, l_max + 1), dtype=np.complex_)
         for s in maps.keys()
@@ -265,26 +273,18 @@ def map2alm_iter(nside, l_max, spins, niter, maps):
     return alm
 
 
-def Fmy(alm, ylm):  # loop over m
-    return alm @ ylm
+def Fmy(alm, ylm):  # tlm,lmr ->tmr
+    return np.sum(alm[:, :, :, None] * ylm[None, :, :, :], axis=1)
 
 
-v_Fmy = np.vectorize(Fmy)  # , in_axes=(2, 1))
-
-
-def Fmy2map(Fmy, phi):  # loop over r
-    return phi @ Fmy
-
-
-v_Fmy2map = np.vectorize(Fmy2map)  # , in_axes=(2, 0))
+def Fmy2map(Fmy, phi):  # tmr,rjm->trj
+    return np.sum(Fmy[:, :, :, None] * phi.transpose(2, 0, 1)[None, :, :, :], axis=1)
 
 
 def alm2ring_ns_dot(ring_i, ylm, phi, alm):
-    mt = np.einsum("tlm,lmr,rjm->trj", alm, ylm, phi)
+    # mt = np.einsum("tlm,lmr,rjm->trj", alm, ylm, phi)
+    mt = Fmy2map(Fmy(alm, ylm), phi)  # rjt
     return mt
-    # # Fmy = v_Fmy(alm[s], ylm[s])  # mtr
-    # mt = v_Fmy2map(v_Fmy(alm, ylm), phi)  # rjt
-    # return mt.transpose(2, 0, 1)  # trj
 
 
 def alm2ring_ns(ring_i, ylm, alm, phi, maps):

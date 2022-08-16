@@ -101,7 +101,12 @@ def sYLM_l2(log_beta, log_beta_s2, l_max, l, ylm):  # m<l, spin 2
     Compute spin-2 (+/-)  Ylm using spin-0 computation.
     Eq. A7 in ref 2.
     """
-    m = np.arange(l_max + 1)
+    l_indx = np.atleast_1d(l)
+    l = np.atleast_1d(l)[:, None, None]
+    m = np.arange(l_max + 1)[None, :, None]
+    log_beta = log_beta[None, None, :]
+    log_beta_s2 = log_beta_s2[None, None, :]
+
     log_m = np.log(m)
 
     log_factorial_norm = 0.5 * (
@@ -114,46 +119,45 @@ def sYLM_l2(log_beta, log_beta_s2, l_max, l, ylm):  # m<l, spin 2
         log_m * 2, np.log(l), np.ones_like(log_m), -1 * np.ones_like(l)
     )
 
-    ylm_2t = np.log(2) - log_beta_s2[None, :] + m2l[:, None]
-    s_ylm_2t = np.ones_like(log_beta_s2)[None, :] * s_m2l[:, None]
+    ylm_2t = np.log(2) - log_beta_s2 + m2l
+    s_ylm_2t = np.ones_like(log_beta_s2) * s_m2l
     del m2l, s_m2l
 
     ylm_2t, s_ylm_2t = logsumexp(
-        ylm_2t, np.log(l) + np.log(l - 1), s_ylm_2t, np.ones_like(l) * -1
+        ylm_2t,
+        np.log(l) + np.log(l - 1),
+        s_ylm_2t,
+        np.ones_like(l) * -1,
     )
 
-    ylm_2t += ylm[0][l, :, :]
-    s_ylm_2t *= ylm[50][l, :, :]
+    ylm_2t += ylm[0][l_indx, :, :]
+    s_ylm_2t *= ylm[50][l_indx, :, :]
 
     ylm_2t, s_ylm_2t = logsumexp(
         ylm_2t,
-        np.log(2)
-        + log_beta[None, :]
-        - log_beta_s2[None, :]
-        + log_alm[:, None]
-        + ylm[0][l - 1, :, :],
+        np.log(2) + log_beta - log_beta_s2 + log_alm + ylm[0][l_indx - 1, :, :],
         s_ylm_2t,
-        ylm[50][l - 1, :, :],
+        ylm[50][l_indx - 1, :, :],
     )
     ylm_2t += log_factorial_norm
-    ylm_2t = np.where(l >= m[:, None], ylm_2t, -np.inf)
-    ylm[2][l, :, :] += ylm_2t
-    ylm[52][l, :, :] = s_ylm_2t
+    ylm_2t = np.where(l >= m, ylm_2t, -np.inf)
+    ylm[2][l_indx, :, :] += ylm_2t
+    ylm[52][l_indx, :, :] = s_ylm_2t
 
     ## now doing -2 case
     ylm_2t, s_ylm_2t = logsumexp(
-        log_alm[:, None] + ylm[0][l - 1, :, :],
-        np.log(l - 1) + log_beta[None, :] + ylm[0][l, :, :],
-        ylm[50][l - 1, :, :],
-        -1 * ylm[50][l, :, :],
+        log_alm + ylm[0][l_indx - 1, :, :],
+        np.log(l - 1) + log_beta + ylm[0][l_indx, :, :],
+        ylm[50][l_indx - 1, :, :],
+        -1 * ylm[50][l_indx, :, :],
     )
-    ylm_2t += np.log(2) + log_m[:, None] - log_beta_s2[None, :]
+    ylm_2t += np.log(2) + log_m - log_beta_s2
     ylm_2t += log_factorial_norm
 
-    ylm_2t = np.where(l >= m[:, None], ylm_2t, -np.inf)
+    ylm_2t = np.where(l >= m, ylm_2t, -np.inf)
     # ylm_2t = np.where(0< m[:, None], ylm_2t, -np.inf)
-    ylm[-2][l, :, :] += ylm_2t
-    ylm[-52][l, :, :] = s_ylm_2t
+    ylm[-2][l_indx, :, :] += ylm_2t
+    ylm[-52][l_indx, :, :] = s_ylm_2t
 
     return ylm
 
@@ -225,8 +229,9 @@ def sYLM_recur_log(l_max, spins, log_beta):
         )  # because 52 is like s2 or sign-2. jax doesnot like strings in keys
         ylm[-52] = np.ones((l_max + 1, l_max + 1, n_theta), dtype=np.int8)  #
 
-        for l in range(2, l_max + 1):
-            ylm = sYLM_l2_i(l, ylm)
+        ylm = sYLM_l2_i(np.arange(2, l_max + 1), ylm)
+        # for l in range(2, l_max + 1):
+        # ylm = sYLM_l2_i(l, ylm)
         # ylm = jax.lax.fori_loop(2, l_max + 1, sYLM_l2_i, ylm)
         ylm[2] = np.exp(ylm[2]) * ylm[52]
         ylm[-2] = np.exp(ylm[-2]) * ylm[-52]
