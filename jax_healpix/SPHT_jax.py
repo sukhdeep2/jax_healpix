@@ -29,7 +29,7 @@ from jax import jit
 # from YLM_jax import *
 from YLM_jax_log import *
 
-RING_ITER_SIZE = 16  # FIXME: User should have some control over this.
+RING_ITER_SIZE = 256  # FIXME: User should have some control over this.
 
 
 def ring_beta(nside):
@@ -176,8 +176,7 @@ v_Gmy2alm = jax.vmap(Gmy2alm, in_axes=(2, 1))  # return shape mlt
 
 
 @jit
-def ring2alm_ns(ring_i, ylm, maps, phi, alm):  # north or south
-    s = 0
+def ring2alm_ns_dot(ring_i, maps, phi, ylm):
     # alm_t = jnp.einsum(  #
     #     "trj,rjm,lmr->tlm",
     #     maps[s][:, ring_i - 1, :],
@@ -185,25 +184,32 @@ def ring2alm_ns(ring_i, ylm, maps, phi, alm):  # north or south
     #     ylm[s],  # [:, :, ring_i - 1],
     # )
     # Gmy = v_Gmy(maps[s][:, ring_i - 1, :], phi)
-    alm_t = v_Gmy2alm(v_Gmy(maps[s][:, ring_i - 1, :], phi), ylm[s])
-    alm_t = alm_t.transpose(2, 1, 0)
-    alm[s] = alm[s].at[:, :, :].add(alm_t)
-    del alm_t
-    if 2 in maps.keys():
-        for y_s in (2, -2):
-            for m_s in (2, -2):
-                alm_t = v_Gmy2alm(
-                    v_Gmy(maps[m_s][:, ring_i - 1, :], phi),
-                    ylm[y_s],
-                )
-                alm_t = alm_t.transpose(2, 1, 0)
-                # a_s = jnp.where(m_s == y_s, 2, -2)
-                a_s = m_s * y_s // 2
-                map_f = jnp.where(
-                    m_s == 2, 1, 1j
-                )  # B-mode has extra 1j factor, which is multiplied in th map2alm
-                alm[a_s] = alm[a_s].at[:, :, :].add(alm_t * map_f)
-                del alm_t
+
+    alm_t = v_Gmy2alm(v_Gmy(maps[:, ring_i - 1, :], phi), ylm).transpose(2, 1, 0)
+    # alm_t = alm_t.transpose(2, 1, 0)
+    return alm_t
+
+
+@partial(jax.jit, static_argnums=(0,))
+def ring2alm_ns(spins, ring_i, ylm, maps, phi, alm):  # north or south
+    if 0 in spins:
+        s = 0
+        alm[s] += ring2alm_ns_dot(ring_i, maps[s], phi, ylm[s])
+
+    if 2 in spins:
+        y_s, m_s = 2, 2  # E-mode
+        alm[2] += ring2alm_ns_dot(
+            ring_i, maps[m_s], phi, ylm[y_s]
+        ) + 1j * ring2alm_ns_dot(ring_i, maps[m_s * -1], phi, ylm[m_s * -1])
+        # alm[2] += alm_t
+
+        y_s, m_s = -2, 2  # B-mode
+        alm[-2] += ring2alm_ns_dot(
+            ring_i, maps[m_s], phi, ylm[y_s]
+        ) + 1j * ring2alm_ns_dot(ring_i, maps[m_s * -1], phi, ylm[y_s * -1])
+
+        # alm[-2] += alm_t
+        # B-mode has extra 1j factor, which is multiplied in th map2alm
     return alm
 
 
@@ -215,10 +221,10 @@ def ring2alm(nside, l_max, spins, maps, log_beta, ring_i0, alm):
     # ring_i = jnp.atleast_1d(ring_i)
 
     ring_i, ylm, phi = north_ring_ylm(nside, l_max, spins, log_beta, ring_i0, -1)
-    alm = ring2alm_ns(ring_i, ylm, maps, phi, alm)
+    alm = ring2alm_ns(spins, ring_i, ylm, maps, phi, alm)
 
     ring_i, ylm = south_ring_ylm(nside, l_max, ring_i, ylm)
-    alm = ring2alm_ns(ring_i, ylm, maps, phi, alm)
+    alm = ring2alm_ns(spins, ring_i, ylm, maps, phi, alm)
 
     return alm
 
