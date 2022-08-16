@@ -232,7 +232,7 @@ def ring2alm(nside, l_max, spins, maps, log_beta, ring_i0, alm):
 @partial(jax.jit, static_argnums=(0, 1, 2))
 def map2alm(nside, l_max, spins, maps):
     alm = {
-        s: jnp.zeros((maps[s].shape[0], l_max + 1, l_max + 1), dtype=jnp.complex64)
+        s: jnp.zeros((maps[s].shape[0], l_max + 1, l_max + 1), dtype=jnp.complex_)
         for s in maps.keys()
     }
     log_beta, _ = ring_log_beta(nside)
@@ -299,28 +299,44 @@ v_Fmy2map = jax.vmap(Fmy2map, in_axes=(2, 0))
 
 
 @jit
-def alm2ring_ns(ring_i, ylm, alm, phi, maps):
-    s = 0
+def alm2ring_ns_dot(ring_i, ylm, phi, alm):
     # mt = jnp.einsum("tlm,lmr,rjm->trj", alm[s], ylm[s], phi)
     # Fmy = v_Fmy(alm[s], ylm[s])  # mtr
-    mt = v_Fmy2map(v_Fmy(alm[s], ylm[s]), phi)  # rjt
-    mt = mt.transpose(2, 0, 1)  # trj
-    maps[s] = maps[s].at[:, ring_i - 1, :].add(mt)
-    del mt
+    mt = v_Fmy2map(v_Fmy(alm, ylm), phi)  # rjt
+    return mt.transpose(2, 0, 1)  # trj
+
+
+@jit
+def alm2ring_ns(ring_i, ylm, alm, phi, maps):
+    if 0 in alm.keys():
+        s = 0
+        maps[s] = (
+            maps[s]
+            .at[:, ring_i - 1, :]
+            .add(alm2ring_ns_dot(ring_i, ylm[s], phi, alm[s]))
+        )
 
     if 2 in alm.keys():
-        for y_s in (2, -2):
-            for a_s in (2, -2):
-                mt = v_Fmy2map(v_Fmy(alm[a_s], ylm[y_s]), phi)  # rjt
-                mt = mt.transpose(2, 0, 1)  # trj
+        y_s, a_s, m_s = 2, 2, 2  # Q map
+        maps[m_s] = (
+            maps[m_s]
+            .at[:, ring_i - 1, :]
+            .add(
+                alm2ring_ns_dot(ring_i, ylm[y_s], phi, alm[a_s])
+                + 1j * alm2ring_ns_dot(ring_i, ylm[y_s * -1], phi, alm[a_s * -1])
+            )
+        )
 
-                m_s = a_s * y_s // 2
-                map_f = jnp.where(
-                    a_s == 2, 1, 1j
-                )  # B-mode has extra 1j factor, which is multiplied in th map2alm
+        y_s, a_s, m_s = -2, 2, -2  # U map
+        maps[m_s] = (
+            maps[m_s]
+            .at[:, ring_i - 1, :]
+            .add(
+                alm2ring_ns_dot(ring_i, ylm[y_s], phi, alm[a_s])
+                + 1j * alm2ring_ns_dot(ring_i, ylm[y_s * -1], phi, alm[a_s * -1])
+            )
+        )
 
-                maps[m_s] = maps[m_s].at[:, ring_i - 1, :].add(mt * map_f)
-                del mt
     return maps
 
 
