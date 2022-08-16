@@ -107,7 +107,6 @@ def log_alpha_lm(l, m):
     """
     return 0.5 * (jnp.log(2 * l + 1) + jnp.log(l**2 - m**2) - jnp.log(2 * l - 1))
     # FIXME: use log_l and log_m
-    # return jnp.sqrt((2 * l + 1) * (l**2 - m**2) / (2 * l - 1))
 
 
 def sYLM_l2(log_beta, log_beta_s2, l_max, l, ylm):  # m<l, spin 2
@@ -115,7 +114,13 @@ def sYLM_l2(log_beta, log_beta_s2, l_max, l, ylm):  # m<l, spin 2
     Compute spin-2 (+/-)  Ylm using spin-0 computation.
     Eq. A7 in ref 2.
     """
-    m = jnp.arange(l_max + 1)
+
+    l_indx = jnp.atleast_1d(l)
+    l = jnp.atleast_1d(l)[:, None, None]
+    m = jnp.arange(l_max + 1)[None, :, None]
+    log_beta = log_beta[None, None, :]
+    log_beta_s2 = log_beta_s2[None, None, :]
+
     log_m = jnp.log(m)
 
     log_factorial_norm = 0.5 * (
@@ -128,46 +133,42 @@ def sYLM_l2(log_beta, log_beta_s2, l_max, l, ylm):  # m<l, spin 2
         log_m * 2, jnp.log(l), jnp.ones_like(log_m), -1 * jnp.ones_like(l)
     )
 
-    ylm_2t = jnp.log(2) - log_beta_s2[None, :] + m2l[:, None]
-    s_ylm_2t = jnp.ones_like(log_beta_s2)[None, :] * s_m2l[:, None]
+    ylm_2t = jnp.log(2) - log_beta_s2 + m2l
+    s_ylm_2t = jnp.ones_like(log_beta_s2) * s_m2l
     del m2l, s_m2l
 
     ylm_2t, s_ylm_2t = logsumexp(
         ylm_2t, jnp.log(l) + jnp.log(l - 1), s_ylm_2t, jnp.ones_like(l) * -1
     )
 
-    ylm_2t += ylm[0][l, :, :]
-    s_ylm_2t *= ylm[50][l, :, :]
+    ylm_2t += ylm[0][l_indx, :, :]
+    s_ylm_2t *= ylm[50][l_indx, :, :]
 
     ylm_2t, s_ylm_2t = logsumexp(
         ylm_2t,
-        jnp.log(2)
-        + log_beta[None, :]
-        - log_beta_s2[None, :]
-        + log_alm[:, None]
-        + ylm[0][l - 1, :, :],
+        jnp.log(2) + log_beta - log_beta_s2 + log_alm + ylm[0][l_indx - 1, :, :],
         s_ylm_2t,
-        ylm[50][l - 1, :, :],
+        ylm[50][l_indx - 1, :, :],
     )
     ylm_2t += log_factorial_norm
-    ylm_2t = jnp.where(l >= m[:, None], ylm_2t, -jnp.inf)
-    ylm[2] = ylm[2].at[l, :, :].add(ylm_2t)
-    ylm[52] = ylm[52].at[l, :, :].set(s_ylm_2t)
+    ylm_2t = jnp.where(l >= m, ylm_2t, -jnp.inf)
+    ylm[2] = ylm[2].at[l_indx, :, :].add(ylm_2t)
+    ylm[52] = ylm[52].at[l_indx, :, :].set(s_ylm_2t)
 
     ## now doing -2 case
     ylm_2t, s_ylm_2t = logsumexp(
-        log_alm[:, None] + ylm[0][l - 1, :, :],
-        jnp.log(l - 1) + log_beta[None, :] + ylm[0][l, :, :],
-        ylm[50][l - 1, :, :],
-        -1 * ylm[50][l, :, :],
+        log_alm + ylm[0][l_indx - 1, :, :],
+        jnp.log(l - 1) + log_beta + ylm[0][l_indx, :, :],
+        ylm[50][l_indx - 1, :, :],
+        -1 * ylm[50][l_indx, :, :],
     )
-    ylm_2t += jnp.log(2) + log_m[:, None] - log_beta_s2[None, :]
+    ylm_2t += jnp.log(2) + log_m - log_beta_s2
     ylm_2t += log_factorial_norm
 
-    ylm_2t = jnp.where(l >= m[:, None], ylm_2t, -jnp.inf)
+    ylm_2t = jnp.where(l >= m, ylm_2t, -jnp.inf)
     # ylm_2t = jnp.where(0< m[:, None], ylm_2t, -jnp.inf)
-    ylm[-2] = ylm[-2].at[l, :, :].add(ylm_2t)
-    ylm[-52] = ylm[-52].at[l, :, :].set(s_ylm_2t)
+    ylm[-2] = ylm[-2].at[l_indx, :, :].add(ylm_2t)
+    ylm[-52] = ylm[-52].at[l_indx, :, :].set(s_ylm_2t)
 
     return ylm
 
@@ -190,14 +191,8 @@ def sYLM_recur_log(l_max, spins, log_beta):
     log_beta = jnp.where(log_beta < -100, -100, log_beta)  # to prevent nans
     log_beta_s = jnp.where(log_beta_s < -100, -100, log_beta_s)  # to prevent nans
 
-    # beta = jnp.where(beta == 0, jnp.exp(-100), beta)
-    # beta_s = jnp.sin(jnp.arccos(jnp.exp(log_beta)))
-    # beta_s = jnp.where(beta_s == 0, jnp.exp(-100), beta_s)
-    # log_beta_s = jnp.log(beta_s)
-    # del beta_s
-
     ylm = {}
-    #     ylm[0]=jnp.zeros((n_lm,n_theta))
+
     ylm[0] = jnp.zeros((l_max + 1, l_max + 1, n_theta))
     ylm[50] = jnp.ones(
         (l_max + 1, l_max + 1, n_theta), dtype=jnp.int8
@@ -207,21 +202,21 @@ def sYLM_recur_log(l_max, spins, log_beta):
     ylm[0] = ylm[0].at[1, 2:, :].set(-jnp.inf)
     ylm[50] = ylm[50].at[0, 0, :].set(1)
 
-    sYLM_ll0_i = jax.tree_util.Partial(
-        sYLM_ll0_log,
-        l_max,
-        log_beta,
-        log_beta_s,
+    sYLM_ll0_i = jax.jit(
+        jax.tree_util.Partial(
+            sYLM_ll0_log,
+            l_max,
+            log_beta,
+            log_beta_s,
+        )
     )
 
-    # ylm = jax.lax.fori_loop(1, l_max + 1, sYLM_ll0_i, ylm)
     ylm = sYLM_ll0_i(ylm)
 
     sYLM_l0_i = jax.tree_util.Partial(  # partial(
         sYLM_l0_log,
         l_max,
         log_beta,
-        # jnp.log(beta_s),
     )
 
     # for l in range(1, l_max + 1):
@@ -231,9 +226,8 @@ def sYLM_recur_log(l_max, spins, log_beta):
 
     ylm[0] -= 0.5 * jnp.log(4 * jnp.pi)
 
-    # if spin_max == 2:
     if 2 in spins or -2 in spins:
-        sYLM_l2_i = partial(sYLM_l2, log_beta, log_beta_s * 2, l_max)
+        sYLM_l2_i = jax.jit(partial(sYLM_l2, log_beta, log_beta_s * 2, l_max))
 
         ylm[2] = jnp.zeros((l_max + 1, l_max + 1, n_theta))
         ylm[-2] = jnp.zeros((l_max + 1, l_max + 1, n_theta))
@@ -248,11 +242,15 @@ def sYLM_recur_log(l_max, spins, log_beta):
 
         #         for l in range(1,l_max+1):
         #             ylm=sYLM_l2_i(l,ylm)
-        ylm = jax.lax.fori_loop(2, l_max + 1, sYLM_l2_i, ylm)
+        # ylm = jax.lax.fori_loop(2, l_max + 1, sYLM_l2_i, ylm)
+        ylm = sYLM_l2_i(jnp.arange(2, l_max + 1), ylm)
         ylm[2] = jnp.exp(ylm[2]) * ylm[52]
         ylm[-2] = jnp.exp(ylm[-2]) * ylm[-52]
-
-    ylm[0] = jnp.exp(ylm[0]) * ylm[50]  # FIXME: spin2 not implemented yet
+        del ylm[52], ylm[-52]
+    if 0 in spins:
+        ylm[0] = jnp.exp(ylm[0]) * ylm[50]  # FIXME: spin2 not implemented yet
+    else:
+        del ylm[0]
     del ylm[50]
     return ylm
 

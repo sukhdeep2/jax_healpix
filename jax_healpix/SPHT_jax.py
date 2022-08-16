@@ -29,7 +29,7 @@ from jax import jit
 # from YLM_jax import *
 from YLM_jax_log import *
 
-RING_ITER_SIZE = 256  # FIXME: User should have some control over this.
+RING_ITER_SIZE = 16  # FIXME: User should have some control over this.
 
 
 def ring_beta(nside):
@@ -191,7 +191,11 @@ def ring2alm_ns_dot(ring_i, maps, phi, ylm):
 
 
 @partial(jax.jit, static_argnums=(0,))
-def ring2alm_ns(spins, ring_i, ylm, maps, phi, alm):  # north or south
+def ring2alm_ns(spins, ring_i, ylm, maps, phi, alm):
+    """
+    Computes alm for a given ring, either on north or south side and add to the alm vector.
+    This func is called twice, onece for ring on the north side and once for the corresponding ring on the south side.
+    """
     if 0 in spins:
         s = 0
         alm[s] += ring2alm_ns_dot(ring_i, maps[s], phi, ylm[s])
