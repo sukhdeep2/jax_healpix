@@ -51,14 +51,14 @@ def syn_alm(n_maps, n_tracers, l_max, cl, rand_seed):
 
 
 # @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
-def synfast(nside, l_max, spin_max, n_tracers, n_maps, cl, rand_seed):
+def synfast(nside, l_max, spins, n_tracers, n_maps, cl, rand_seed):
     n_tracers_total = sum(n_tracers)
     alm_sim0 = syn_alm(n_maps, n_tracers_total, l_max, cl, rand_seed)
 
     alm_sim = {}
     ni = 0
     si = 0
-    for s in range(0, spin_max + 1, 2):
+    for s in spins:
         alm_sim[s] = alm_sim0[:, ni : n_tracers[si], :, :].reshape(
             n_maps * n_tracers[s], l_max + 1, l_max + 1
         )
@@ -66,7 +66,7 @@ def synfast(nside, l_max, spin_max, n_tracers, n_maps, cl, rand_seed):
         si += 1
     del alm_sim0
     print("synfast got all alms")
-    maps = alm2map(nside, l_max, spin_max, alm_sim)
+    maps = alm2map(nside, l_max, spins, alm_sim)
 
     for s in maps.keys():
         maps[s] = maps[s].reshape(n_maps, n_tracers[s], 4 * nside - 1, 4 * nside)

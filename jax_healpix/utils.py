@@ -3,6 +3,12 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 import pickle, sys
+from jax.scipy.special import gammaln as loggamma
+
+
+# @jit
+# def loggamma(n):
+#     return jnp.sum(jnp.log(jnp.arange(n) + 1))
 
 
 def logdiffexp(log_a, log_b):  # assume a>b
@@ -27,7 +33,8 @@ def logsumexp(log_A, log_B, sign_A, sign_B):
     max_Arr = jnp.maximum(log_A, log_B)
     min_Arr = jnp.minimum(log_A, log_B)
 
-    log_s = max_Arr + jnp.log(1 + sign_s * jnp.exp(min_Arr - max_Arr))
+    # log_s = max_Arr + jnp.log(1 + sign_s * jnp.exp(min_Arr - max_Arr))
+    log_s = max_Arr + jnp.log1p(sign_s * jnp.exp(min_Arr - max_Arr))
     # FIXME: this can be made better for very small numbers.
     # FIXME: see https://en.wikipedia.org/wiki/Natural_logarithm#lnp1 and np.log1p
 

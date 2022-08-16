@@ -122,7 +122,9 @@ def sYLM_l2(beta, beta_s2, l_max, l, ylm):  # m<l, spin 2
     Eq. A7 in ref 2.
     """
     m = jnp.arange(l_max + 1)
-
+    log_factorial_norm = 0.5 * (
+        loggamma(l - 2 + 1) - loggamma(l + 2 + 1)
+    )  # eq. A6 of ref 2
     alm = alpha_lm(l, m)
     ylm[2] = (
         ylm[2]
@@ -145,11 +147,16 @@ def sYLM_l2(beta, beta_s2, l_max, l, ylm):  # m<l, spin 2
 
     ylm[-2] = ylm[-2].at[l, :, :].multiply(2 * m[:, None] / beta_s2[None, :])
 
+    ylm[-2] = ylm[-2].at[l, :, :].multiply(jnp.exp(log_factorial_norm))
+    ylm[2] = ylm[2].at[l, :, :].multiply(jnp.exp(log_factorial_norm))
+
+    ylm[2] = jnp.where(l >= m[:, None], ylm[2], 0)
+    ylm[-2] = jnp.where(l >= m[:, None], ylm[-2], 0)
     return ylm
 
 
 @partial(jax.jit, static_argnums=(0, 1))
-def sYLM_recur(l_max, spin_max, beta):
+def sYLM_recur(l_max, spins, beta):
     """
     Computes all Ylm using recusion. There is only one loop, over l.
     spin_max: 0 or 2, depending on Ylm desired. Spin_max=2 will return both spin-0 and spin-2 Ylm.
@@ -190,7 +197,8 @@ def sYLM_recur(l_max, spin_max, beta):
     # ylm[0] = ylm[0].at[:, 0, :].divide(2)  # FIXME: ????????????
     # ylm[0] = ylm[0].at[:, 1:, :].multiply(2)  # FIXME: ????????????
 
-    if spin_max == 2:
+    # if spin_max == 2:
+    if 2 in spins or -2 in spins:
         sYLM_l2_i = partial(sYLM_l2, beta, beta_s**2, l_max)
         ylm[2] = jnp.zeros((l_max + 1, l_max + 1, n_theta))
         ylm[-2] = jnp.zeros((l_max + 1, l_max + 1, n_theta))
