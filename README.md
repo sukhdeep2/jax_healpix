@@ -101,7 +101,7 @@ synth_maps = synthesizer.synfast(
     nside=nside,
     l_max=lmax,
     spins_to_generate=(0,),
-    tracer_info=tracer_info_synth, 
+    tracer_info=tracer_info_synth,
     cls_input=cls_for_synthesis, # Renamed from cls_dict in test to cls_input
     rand_seed=42 # Direct seed value
 )

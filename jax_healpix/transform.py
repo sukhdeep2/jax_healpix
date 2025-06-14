@@ -33,10 +33,23 @@ class HealpixTransformer:
 
         self.ring_beta_values = self.grid.ring_beta()
 
-    @partial(jit, static_argnums=(0,))
+    # Removed JIT from this method to avoid ConcretizationTypeError with npix_in_ring
+    # The functions it calls (_get_ring_properties -> _calculate_ring_pol/eq) are JITted.
     def _get_phi_m_for_ring(self, ring_i, phase_sign):
-        phi_0, npix_in_ring, beta_val = self.grid.get_ring_properties(ring_i)
-        npix_in_ring = npix_in_ring.astype(jnp.int32)
+        # ring_i can be a JAX tracer here when called from lax.scan
+        phi_0, npix_in_ring_float, beta_val = self.grid.get_ring_properties(ring_i)
+
+        # npix_in_ring_float is a 0-d JAX array (tracer). For jnp.arange, it needs to be concrete
+        # if the arange itself is not part of a JITted computation that can handle dynamic shapes.
+        # However, if this function _get_phi_m_for_ring is NOT JITted, we can use .item()
+        # but ring_i is a tracer, so get_ring_properties returns tracers.
+        # The issue is using a tracer (npix_in_ring_float) for the range of jnp.arange.
+        # jnp.arange needs a static upper limit for JIT or a concrete value when not JITted.
+        # If _get_phi_m_for_ring is not JITted, ring_i is passed as a tracer from lax.scan.
+        # get_ring_properties then uses lax.cond, returning tracers.
+        # So npix_in_ring_float is a tracer.
+        # This means jnp.arange(npix_in_ring_float.astype(jnp.int32)) is okay if not JITted.
+        npix_in_ring = npix_in_ring_float.astype(jnp.int32)
 
         m_vals = jnp.arange(self.l_max + 1)
         j_pix_indices = jnp.arange(npix_in_ring)
@@ -49,9 +62,10 @@ class HealpixTransformer:
 
     @partial(jit, static_argnums=(0,))
     def _map2alm_ring_contribution(self, ring_i, maps_TQU_0, maps_TQU_2, maps_TQU_neg2, current_alm_0, current_alm_2, current_alm_neg2):
-        alm_0_contrib = jnp.zeros_like(current_alm_0)
-        alm_2_contrib = jnp.zeros_like(current_alm_2)
-        alm_neg2_contrib = jnp.zeros_like(current_alm_neg2)
+        # Initialize contributions based on whether the corresponding alm accumulators are provided
+        alm_0_contrib = jnp.zeros_like(current_alm_0) if current_alm_0 is not None else None
+        alm_2_contrib = jnp.zeros_like(current_alm_2) if current_alm_2 is not None else None
+        alm_neg2_contrib = jnp.zeros_like(current_alm_neg2) if current_alm_neg2 is not None else None
 
         phi_factors_north, _, npix_north = self._get_phi_m_for_ring(ring_i, phase_sign=-1.0)
         beta_north_val_scalar = self.ring_beta_values[ring_i-1]
@@ -65,12 +79,12 @@ class HealpixTransformer:
                 ylm_val_raw = self.ylm_calculator.get_ylm(s_ylm, jnp.array([beta_north_val_scalar]))
                 ylm_north[s_ylm] = ylm_val_raw.squeeze(axis=-1)
 
-        if maps_TQU_0 is not None and current_alm_0 is not None:
+        if maps_TQU_0 is not None and alm_0_contrib is not None: # Check alm_0_contrib too
             map_T_ring_north = maps_TQU_0[..., ring_i-1, 0:npix_north]
             G_m_T_north = jnp.dot(map_T_ring_north, jnp.conjugate(phi_factors_north.T))
             alm_0_contrib += G_m_T_north[None, :] * ylm_north[0]
 
-        if maps_TQU_2 is not None and maps_TQU_neg2 is not None and current_alm_2 is not None and current_alm_neg2 is not None:
+        if maps_TQU_2 is not None and maps_TQU_neg2 is not None and alm_2_contrib is not None and alm_neg2_contrib is not None: # Check contribs
             map_Q_ring_north = maps_TQU_2[..., ring_i-1, 0:npix_north]
             map_U_ring_north = maps_TQU_neg2[..., ring_i-1, 0:npix_north]
             G_m_Q_north = jnp.dot(map_Q_ring_north, jnp.conjugate(phi_factors_north.T))
@@ -93,12 +107,12 @@ class HealpixTransformer:
                 if s_ylm_val == -2:
                     ylm_south[s_ylm_val] *= -1.0
 
-            if maps_TQU_0 is not None and current_alm_0 is not None:
+            if maps_TQU_0 is not None and alm_0_contrib is not None: # Check alm_0_contrib too
                 map_T_ring_south = maps_TQU_0[..., south_ring_actual_idx-1, 0:npix_south]
                 G_m_T_south = jnp.dot(map_T_ring_south, jnp.conjugate(phi_factors_south.T))
                 alm_0_contrib += G_m_T_south[None, :] * ylm_south[0]
 
-            if maps_TQU_2 is not None and maps_TQU_neg2 is not None and current_alm_2 is not None and current_alm_neg2 is not None:
+            if maps_TQU_2 is not None and maps_TQU_neg2 is not None and alm_2_contrib is not None and alm_neg2_contrib is not None: # Check contribs
                 map_Q_ring_south = maps_TQU_2[..., south_ring_actual_idx-1, 0:npix_south]
                 map_U_ring_south = maps_TQU_neg2[..., south_ring_actual_idx-1, 0:npix_south]
                 G_m_Q_south = jnp.dot(map_Q_ring_south, jnp.conjugate(phi_factors_south.T))
@@ -386,11 +400,11 @@ class HealpixTransformer:
         map_2d_shape = batch_shape + (4 * self.nside - 1, 4 * self.nside)
         map_2d = jnp.zeros(map_2d_shape, dtype=map_1d.dtype)
         pix_offset = 0
-        for r in range(1, 4 * self.nside):
-            ring_idx_0_based = r - 1
-            is_polar = r < self.nside or r > 3 * self.nside
+        for r_idx_0based_loop in range(1, 4 * self.nside): # Corrected loop variable name
+            ring_idx_0_based = r_idx_0based_loop - 1
+            is_polar = r_idx_0based_loop < self.nside or r_idx_0based_loop > 3 * self.nside
             if is_polar:
-                ring_i_calc = r if r < self.nside else 4 * self.nside - r
+                ring_i_calc = r_idx_0based_loop if r_idx_0based_loop < self.nside else 4 * self.nside - r_idx_0based_loop
                 pixels_in_ring = 4 * ring_i_calc
             else:
                 pixels_in_ring = 4 * self.nside
@@ -425,99 +439,68 @@ class HealpixTransformer:
         num_rings = map_2d.shape[-2]
         npix = 12 * self.nside * self.nside
         output_list = []
-        for r_idx_0based in range(num_rings):
-            r_phys = r_idx_0based + 1
+        for r_idx_0based_loop in range(num_rings): # Corrected loop variable name
+            r_phys = r_idx_0based_loop + 1
             is_polar = r_phys < self.nside or r_phys > 3 * self.nside
             if is_polar:
                 ring_i_calc = r_phys if r_phys < self.nside else 4 * self.nside - r_phys
                 pixels_in_ring = 4 * ring_i_calc
             else:
                 pixels_in_ring = 4 * self.nside
-            ring_slice = map_2d[..., r_idx_0based, 0:pixels_in_ring]
+            ring_slice = map_2d[..., r_idx_0based_loop, 0:pixels_in_ring] # Use corrected loop variable
             output_list.append(ring_slice)
         map_1d = jnp.concatenate(output_list, axis=-1)
         return map_1d.reshape(batch_shape + (npix,))
 
     # --- Method for Cl computation ---
     @staticmethod
-    @partial(jit, static_argnums=(0,)) # l_max is static
+    @partial(jit, static_argnames=('l_max',)) # Reverted to this based on other static methods.
     def _compute_cl_from_single_alm_set(l_max, alm1_coeffs, alm2_coeffs_optional=None):
-        # alm_coeffs are expected to be [..., l_max+1(L), l_max+1(M)]
-
-        # Validate shapes roughly, full validation might be too complex for JIT
-        # if alm1_coeffs.ndim < 2: # This check might not JIT well.
-            # raise ValueError("alm1_coeffs must have at least 2 dimensions (L,M).")
-            # Consider removing runtime checks for JIT or using jax.debug.print for checks.
-
-        # Factor for m>0 modes. Assumes m is the last dimension.
-        # alm_X_processed = alm_X_coeffs for m=0
-        # alm_X_processed = alm_X_coeffs * sqrt(2) for m>0
-
-        # Process alm1
         alm1_processed = alm1_coeffs
-        if l_max > 0: # only apply if there are m>0 modes
-            # This applies sqrt(2) to m=1, ..., l_max columns for all l rows
-            alm1_processed = alm1_processed.at[..., 0].set(alm1_coeffs[..., 0]) # m=0 unchanged
+        if l_max > 0:
+            alm1_processed = alm1_processed.at[..., 0].set(alm1_coeffs[..., 0])
             alm1_processed = alm1_processed.at[..., 1:].set(alm1_coeffs[..., 1:] * jnp.sqrt(2.0))
 
         if alm2_coeffs_optional is None:
-            alm2_processed = alm1_processed # Auto-correlation
+            alm2_processed = alm1_processed
         else:
-            # if alm2_coeffs_optional.ndim < 2: # Similar JIT concern
-                # raise ValueError("alm2_coeffs_optional must have at least 2 dimensions (L,M).")
             alm2_processed = alm2_coeffs_optional
             if l_max > 0:
                 alm2_processed = alm2_processed.at[..., 0].set(alm2_coeffs_optional[..., 0])
                 alm2_processed = alm2_processed.at[..., 1:].set(alm2_coeffs_optional[..., 1:] * jnp.sqrt(2.0))
 
-        # Sum over m: real(alm1 * conj(alm2))
-        # Resulting shape should be [..., l_max+1 (L)]
         cl_val = jnp.real( (alm1_processed * jnp.conjugate(alm2_processed)).sum(axis=-1) )
 
-        # Denominator (2l+1)
-        l_values = jnp.arange(l_max + 1, dtype=jnp.float32) # Ensures float division
+        l_values = jnp.arange(l_max + 1, dtype=jnp.float32)
         denominator = 2.0 * l_values + 1.0
 
-        # cl_val has shape [..., L], denominator has shape [L]
-        cl_val = cl_val / denominator # Broadcasting should handle batch dims
+        cl_val = cl_val / denominator
         return cl_val
 
     def compute_cl(self, alm_dict_or_array, alm2_dict_or_array=None):
-        """
-        Computes power spectra (Cl) from alm coefficients.
-        Args:
-            alm_dict_or_array: A single alm array [..., l_max+1, l_max+1] or
-                               a dictionary {spin: alm_array}.
-            alm2_dict_or_array: Optional. Same format as alm_dict_or_array.
-                                If None, auto-correlation is computed.
-        Returns:
-            A single Cl array [..., l_max+1] or a dictionary {(s1,s2): Cl_array}.
-        """
-        l_max = self.l_max # Use l_max from instance
+        l_max = self.l_max
 
         is_dict1 = isinstance(alm_dict_or_array, dict)
         is_dict2 = isinstance(alm2_dict_or_array, dict)
 
-        if not is_dict1: # Input1 is a single array
+        if not is_dict1:
             if is_dict2:
                 raise TypeError("If alm1 is an array, alm2 must be an array or None.")
-            # Both are arrays or alm2 is None
             return HealpixTransformer._compute_cl_from_single_alm_set(
                 l_max, alm_dict_or_array, alm2_dict_or_array
             )
-        else: # Input1 is a dictionary
+        else:
             output_cls_dict = {}
-            if alm2_dict_or_array is None: # Auto-correlations for dict1
+            if alm2_dict_or_array is None:
                 for s1, alm1 in alm_dict_or_array.items():
                     output_cls_dict[(s1, s1)] = HealpixTransformer._compute_cl_from_single_alm_set(
                         l_max, alm1, None
                     )
-            elif not is_dict2: # alm1 is dict, alm2 is array -> invalid combination for clarity
+            elif not is_dict2:
                  raise TypeError("If alm1 is a dict, alm2 must be a dict or None.")
-            else: # Both are dictionaries, compute all cross-correlations
+            else:
                 for s1, alm1 in alm_dict_or_array.items():
                     for s2, alm2 in alm2_dict_or_array.items():
-                        # Optional: could sort (s1,s2) to avoid duplicate (s2,s1) if Cl_s1s2 = Cl_s2s1
                         output_cls_dict[(s1, s2)] = HealpixTransformer._compute_cl_from_single_alm_set(
                             l_max, alm1, alm2
                         )

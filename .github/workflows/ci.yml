@@ -1,0 +1,37 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ main ] # Or your default branch
+  pull_request:
+    branches: [ main ] # Or your default branch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"] # Test against a few Python versions
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest numpy healpy
+        # Install JAX (CPU version for CI, or specify CUDA version if needed for specific tests)
+        # For JAX versions and Python compatibility, refer to official JAX docs.
+        # Using a version that's generally compatible with recent Python versions.
+        pip install "jax[cpu]" jaxlib
+        # If your project code (jax_healpix) needs to be installed itself:
+        # pip install .  # If you have a setup.py or pyproject.toml
+
+    - name: Test with pytest
+      run: |
+        pytest tests/
