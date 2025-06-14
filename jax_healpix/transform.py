@@ -440,7 +440,7 @@ class HealpixTransformer:
 
     # --- Method for Cl computation ---
     @staticmethod
-    @partial(jit, static_argnames=(0,)) # l_max is static
+    @partial(jit, static_argnums=(0,)) # l_max is static
     def _compute_cl_from_single_alm_set(l_max, alm1_coeffs, alm2_coeffs_optional=None):
         # alm_coeffs are expected to be [..., l_max+1(L), l_max+1(M)]
 
@@ -522,5 +522,3 @@ class HealpixTransformer:
                             l_max, alm1, alm2
                         )
             return output_cls_dict
-
-```
