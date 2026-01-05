@@ -1,0 +1,43 @@
+# Build artifacts
+cuda/build/
+*.o
+*.so
+*.a
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test outputs
+*.log
+*.tmp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Data files (large)
+data/
+
+# Claude Code
+.claude/
+
+# Environment
+.env
+*.env

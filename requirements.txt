@@ -1,0 +1,13 @@
+# Core dependencies for SPHT JAX implementation
+jax>=0.4.20
+jaxlib>=0.4.20
+numpy>=1.24.0
+healpy>=1.16.0
+
+# For profiling and benchmarking
+pytest>=7.4.0
+pytest-benchmark>=4.0.0
+
+# For CUDA implementation (will be added when ready)
+# cuda-python>=12.0.0  # CUDA Python bindings
+# cupy-cuda12x>=12.0.0  # CuPy for GPU arrays
