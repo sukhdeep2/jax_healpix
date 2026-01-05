@@ -62,6 +62,13 @@ void map2alm_cuda(int nside, int l_max, int n_maps,
                   const real_t* map_in, complex_t* alm_out);
 
 /**
+ * Optimized map2alm using cuFFT and cuBLAS
+ * Same interface as map2alm_cuda
+ */
+void map2alm_cuda_v2(int nside, int l_max, int n_maps,
+                     const real_t* map_in, complex_t* alm_out);
+
+/**
  * Standalone alm2map (no context needed)
  */
 void alm2map_cuda(int nside, int l_max, int n_maps,

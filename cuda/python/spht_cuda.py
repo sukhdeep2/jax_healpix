@@ -51,6 +51,10 @@ def _setup_functions(lib):
     lib.map2alm_cuda.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p]
     lib.map2alm_cuda.restype = None
 
+    # Add optimized version
+    lib.map2alm_cuda_v2.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p]
+    lib.map2alm_cuda_v2.restype = None
+
     # alm2map_cuda
     lib.alm2map_cuda.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p]
     lib.alm2map_cuda.restype = None
@@ -145,17 +149,19 @@ RING_BATCH_SIZE = 16  # Match CUDA constant
 class SPHTCuda:
     """CUDA-accelerated Spherical Harmonic Transforms on HEALPix grid."""
 
-    def __init__(self, nside: int, l_max: int = None):
+    def __init__(self, nside: int, l_max: int = None, use_v2: bool = True):
         """
         Initialize SPHT CUDA context.
 
         Args:
             nside: HEALPix nside parameter (must be power of 2)
             l_max: Maximum l value. Defaults to 3*nside.
+            use_v2: Use optimized cuFFT/cuBLAS implementation. Defaults to True.
         """
         self.nside = nside
         self.l_max = l_max if l_max is not None else 3 * nside
         self.n_rings = 4 * nside - 1
+        self.use_v2 = use_v2
         self._lib = _get_lib()
 
     def map2alm(self, maps: dict, spins: tuple = (0,)) -> dict:
@@ -211,7 +217,10 @@ class SPHTCuda:
                     raise RuntimeError("Failed to copy map to device")
 
                 # Run transform
-                self._lib.map2alm_cuda(self.nside, self.l_max, n_maps, d_map, d_alm)
+                if self.use_v2:
+                    self._lib.map2alm_cuda_v2(self.nside, self.l_max, n_maps, d_map, d_alm)
+                else:
+                    self._lib.map2alm_cuda(self.nside, self.l_max, n_maps, d_map, d_alm)
 
                 # Copy result back
                 alm_shape = (n_maps, self.l_max + 1, self.l_max + 1)

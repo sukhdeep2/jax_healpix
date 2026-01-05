@@ -10,6 +10,8 @@
 // External declarations from transform files
 extern "C" void map2alm_cuda(int nside, int l_max, int n_maps,
                               const real_t* map_in, complex_t* alm_out);
+extern "C" void map2alm_cuda_v2(int nside, int l_max, int n_maps,
+                                 const real_t* map_in, complex_t* alm_out);
 extern "C" void alm2map_cuda(int nside, int l_max, int n_maps,
                               const complex_t* alm_in, real_t* map_out);
 

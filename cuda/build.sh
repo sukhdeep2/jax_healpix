@@ -62,6 +62,8 @@ SOURCES=(
     "ring_integrate.cu"
     "alm2map.cu"
     "map2alm.cu"
+    "map2alm_v2.cu"    # NEW: Optimized version
+    "fft_gm.cu"        # NEW: FFT-based Gm
     "spht_api.cu"
 )
 
@@ -82,7 +84,9 @@ ${NVCC} ${ARCH_FLAGS} -Xcompiler -fPIC -dlink -o "${BUILD_DIR}/device_link.o" ${
 # Create shared library
 echo ""
 echo "Creating shared library..."
-${NVCC} -shared -Xcompiler -fPIC -o "${BUILD_DIR}/libspht_cuda.so" ${OBJECTS} "${BUILD_DIR}/device_link.o" -lcudart
+${NVCC} -shared -Xcompiler -fPIC -o "${BUILD_DIR}/libspht_cuda.so" \
+    ${OBJECTS} "${BUILD_DIR}/device_link.o" \
+    -lcudart -lcufft -lcublas
 
 echo ""
 echo "Building test executables..."

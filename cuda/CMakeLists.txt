@@ -32,14 +32,16 @@ set(CUDA_SOURCES
     src/ring_integrate.cu
     src/alm2map.cu
     src/map2alm.cu
+    src/map2alm_v2.cu    # NEW
+    src/fft_gm.cu        # NEW
     src/spht_api.cu
 )
 
 # Build shared library
 add_library(spht_cuda SHARED ${CUDA_SOURCES})
 
-# Link CUDA runtime
-target_link_libraries(spht_cuda CUDA::cudart)
+# Link cuFFT and cuBLAS
+target_link_libraries(spht_cuda CUDA::cudart CUDA::cufft CUDA::cublas)
 
 # Set compiler flags
 target_compile_options(spht_cuda PRIVATE
