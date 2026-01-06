@@ -25,16 +25,26 @@ endif()
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/bluestein)
 
-# Source files
-set(CUDA_SOURCES
+# Source files - organized by module
+set(BLUESTEIN_SOURCES
+    src/bluestein/bluestein_core.cu
+    src/bluestein/bluestein_forward.cu
+    src/bluestein/bluestein_inverse.cu
+)
+
+set(CORE_SOURCES
     src/ylm_recurrence.cu
-    src/ring_integrate.cu
-    src/alm2map.cu
-    src/map2alm.cu
-    src/map2alm_v2.cu    # NEW
-    src/fft_gm.cu        # NEW
+    src/map2alm_v6.cu
+    src/alm2map_v6.cu
+    src/alm2cl.cu
     src/spht_api.cu
+)
+
+set(CUDA_SOURCES
+    ${BLUESTEIN_SOURCES}
+    ${CORE_SOURCES}
 )
 
 # Build shared library

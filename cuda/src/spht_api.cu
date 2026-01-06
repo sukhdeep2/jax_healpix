@@ -7,13 +7,11 @@
 #include "../include/ring_processing.cuh"
 #include <stdio.h>
 
-// External declarations from transform files
-extern "C" void map2alm_cuda(int nside, int l_max, int n_maps,
-                              const real_t* map_in, complex_t* alm_out);
-extern "C" void map2alm_cuda_v2(int nside, int l_max, int n_maps,
+// External declarations from v6 transform files
+extern "C" void map2alm_cuda_v6(int nside, int l_max, int n_maps,
                                  const real_t* map_in, complex_t* alm_out);
-extern "C" void alm2map_cuda(int nside, int l_max, int n_maps,
-                              const complex_t* alm_in, real_t* map_out);
+extern "C" void alm2map_cuda_v6(int nside, int l_max, int n_maps,
+                                 const complex_t* alm_in, real_t* map_out);
 
 spht_context_t* spht_create_context(int nside, int l_max) {
     spht_context_t* ctx = (spht_context_t*)malloc(sizeof(spht_context_t));
@@ -40,7 +38,7 @@ int spht_map2alm(spht_context_t* ctx, int n_maps,
                  const real_t* map_in, complex_t* alm_out) {
     if (!ctx || !map_in || !alm_out) return -1;
 
-    map2alm_cuda(ctx->nside, ctx->l_max, n_maps, map_in, alm_out);
+    map2alm_cuda_v6(ctx->nside, ctx->l_max, n_maps, map_in, alm_out);
     return 0;
 }
 
@@ -48,7 +46,7 @@ int spht_alm2map(spht_context_t* ctx, int n_maps,
                  const complex_t* alm_in, real_t* map_out) {
     if (!ctx || !alm_in || !map_out) return -1;
 
-    alm2map_cuda(ctx->nside, ctx->l_max, n_maps, alm_in, map_out);
+    alm2map_cuda_v6(ctx->nside, ctx->l_max, n_maps, alm_in, map_out);
     return 0;
 }
 

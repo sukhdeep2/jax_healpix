@@ -11,9 +11,9 @@ INCLUDE_DIR="${SCRIPT_DIR}/include"
 # CUDA compiler
 NVCC=nvcc
 
-# Compiler flags
-NVCC_FLAGS="-O3 --use_fast_math -Xcompiler -fPIC -lineinfo"
-NVCC_FLAGS="$NVCC_FLAGS -I${INCLUDE_DIR}"
+# Compiler flags - can be overridden via environment variable
+: "${NVCC_FLAGS:=-O3 --use_fast_math -Xcompiler -fPIC -lineinfo}"
+NVCC_FLAGS="$NVCC_FLAGS -I${INCLUDE_DIR} -I${SRC_DIR}/bluestein"
 
 # Architecture flags (adjust for your GPU)
 # Detected: compute capability 8.6 (Ampere - RTX 3080/3090)
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --debug)
             DEBUG=1
-            NVCC_FLAGS="-g -G -O0 -Xcompiler -fPIC -I${INCLUDE_DIR}"
+            NVCC_FLAGS="-g -G -O0 -Xcompiler -fPIC -I${INCLUDE_DIR} -I${SRC_DIR}/bluestein"
             shift
             ;;
         --clean)
@@ -54,31 +54,35 @@ mkdir -p "${BUILD_DIR}"
 echo "Building SPHT CUDA library..."
 echo "  Source dir: ${SRC_DIR}"
 echo "  Build dir: ${BUILD_DIR}"
+echo "  NVCC flags: ${NVCC_FLAGS}"
 echo ""
 
-# Source files
-SOURCES=(
+# Source files - organized by module
+# Bluestein module (modularized FFT implementation)
+BLUESTEIN_SOURCES=(
+    "bluestein/bluestein_core.cu"
+    "bluestein/bluestein_forward.cu"
+    "bluestein/bluestein_inverse.cu"
+)
+
+# Core transform sources
+CORE_SOURCES=(
     "ylm_recurrence.cu"
-    "ring_integrate.cu"
-    "alm2map.cu"
-    "map2alm.cu"
-    "map2alm_v2.cu"    # FFT + cuBLAS version
-    "map2alm_v3.cu"    # Fused per-ring parallel version
-    "map2alm_v4.cu"    # Tiled version for large nside
-    "map2alm_v5.cu"    # Multi-precision templated version
     "map2alm_v6.cu"    # Optimal warp-per-m, NO atomics
-    "alm2map_v5.cu"    # Multi-precision synthesis version
     "alm2map_v6.cu"    # Optimal warp-per-m synthesis (matching map2alm_v6)
     "alm2cl.cu"        # Power spectrum computation
-    "fft_gm.cu"        # FFT-based Gm
-    "bluestein_fft.cu" # Bluestein FFT for arbitrary-size DFT/IDFT
     "spht_api.cu"
 )
+
+# Combine all sources
+SOURCES=("${BLUESTEIN_SOURCES[@]}" "${CORE_SOURCES[@]}")
 
 # Compile each source file to object
 OBJECTS=""
 for src in "${SOURCES[@]}"; do
-    obj="${BUILD_DIR}/${src%.cu}.o"
+    # Handle subdirectory sources
+    obj_name="${src//\//_}"
+    obj="${BUILD_DIR}/${obj_name%.cu}.o"
     echo "Compiling ${src}..."
     ${NVCC} ${NVCC_FLAGS} ${ARCH_FLAGS} -dc -o "${obj}" "${SRC_DIR}/${src}"
     OBJECTS="${OBJECTS} ${obj}"

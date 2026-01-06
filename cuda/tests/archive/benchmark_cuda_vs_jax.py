@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Benchmark CUDA vs JAX SPHT implementations across different precisions.
+
+Usage:
+    python benchmark_cuda_vs_jax.py [nside] [n_iterations]
+
+    nside: HEALPix resolution parameter (default: 64)
+    n_iterations: Number of iterations for timing (default: 10)
+"""
+
+import numpy as np
+import sys
+import time
+sys.path.insert(0, '/home/deep/repos/SPHT/cuda/python')
+sys.path.insert(0, '/home/deep/repos/SPHT/jax_healpix')
+
+import jax
+from spht_cuda import (SPHTCuda, set_precision, config,
+                       set_phase1_method, PHASE1_DFT, PHASE1_BLUESTEIN)
+
+# Default parameters
+NSIDE = 64
+N_ITERATIONS = 2
+
+
+def benchmark_jax(nside, l_max, n_iterations, dtype_name):
+    """Benchmark JAX map2alm with specified precision."""
+    # Set JAX precision
+    if dtype_name == 'float64':
+        jax.config.update("jax_enable_x64", True)
+        dtype = np.float64
+    elif dtype_name == 'float32':
+        jax.config.update("jax_enable_x64", False)
+        dtype = np.float32
+    elif dtype_name == 'bfloat16':
+        jax.config.update("jax_enable_x64", False)
+        dtype = np.float32  # Input as float32, will convert to bfloat16
+    else:
+        raise ValueError(f"Unknown dtype: {dtype_name}")
+
+    # Import after setting config
+    import jax.numpy as jnp
+    from SPHT_jax import map2alm as jax_map2alm
+
+    n_rings = 4 * nside - 1
+    n_maps = 1  # Single map as array of size 1
+
+    # Create random map array [n_maps, n_rings, 4*nside]
+    np.random.seed(42)
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(dtype)
+
+    if dtype_name == 'bfloat16':
+        map_jax = {0: jnp.array(map_array, dtype=jnp.bfloat16)}
+    else:
+        map_jax = {0: jnp.array(map_array)}
+
+    # Warmup
+    _ = jax_map2alm(nside, l_max, (0,), map_jax)
+    jax.block_until_ready(_)
+
+    # Benchmark
+    times = []
+    for _ in range(n_iterations):
+        start = time.perf_counter()
+        result = jax_map2alm(nside, l_max, (0,), map_jax)
+        jax.block_until_ready(result)
+        end = time.perf_counter()
+        times.append(end - start)
+
+    return np.mean(times), np.std(times)
+
+
+def benchmark_cuda(nside, l_max, n_iterations, storage_precision='float64',
+                   recurrence_precision='float64', version='v5', n_maps=1,
+                   phase1_method=None):
+    """Benchmark CUDA map2alm with specified precision.
+
+    Args:
+        storage_precision: 'float64' or 'float32' for map/alm storage
+        recurrence_precision: 'float64' or 'float32' for Ylm recurrence
+        version: CUDA implementation version ('v4', 'v5', 'v6')
+        n_maps: Number of maps to process (array of maps)
+        phase1_method: Phase 1 method for v6 (PHASE1_DFT or PHASE1_BLUESTEIN)
+    """
+    # Set phase1 method if specified (v6 only)
+    if phase1_method is not None:
+        set_phase1_method(phase1_method)
+
+    spht_cuda = SPHTCuda(nside, l_max, version=version,
+                         storage_precision=storage_precision,
+                         recurrence_precision=recurrence_precision)
+
+    n_rings = 4 * nside - 1
+
+    # Create random map array [n_maps, n_rings, 4*nside]
+    np.random.seed(42)
+    dtype = np.float32 if storage_precision == 'float32' else np.float64
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(dtype)
+
+    # Warmup
+    _ = spht_cuda.map2alm({0: map_array}, spins=(0,))
+
+    # Benchmark
+    times = []
+    for _ in range(n_iterations):
+        start = time.perf_counter()
+        result = spht_cuda.map2alm({0: map_array}, spins=(0,))
+        end = time.perf_counter()
+        times.append(end - start)
+
+    return np.mean(times), np.std(times)
+
+
+def run_benchmark(nside, n_iterations):
+    """Run full benchmark suite."""
+    l_max = 3 * nside
+    n_pix = 12 * nside * nside
+    n_alm = (l_max + 1) * (l_max + 2) // 2
+
+    print("=" * 80)
+    print("CUDA vs JAX SPHT Benchmark")
+    print("=" * 80)
+    print(f"  nside      = {nside}")
+    print(f"  l_max      = {l_max}")
+    print(f"  n_pixels   = {n_pix:,}")
+    print(f"  n_alm      = {n_alm:,}")
+    print(f"  iterations = {n_iterations}")
+    print("=" * 80)
+    print()
+
+    results = {}
+
+    # CUDA benchmarks with different precision configurations
+    # Format: (name, storage, recurrence, version, phase1_method)
+    cuda_configs = [
+        # v5 configurations
+        # ('v5_f64_f64', 'float64', 'float64', 'v5', None),  # Full float64
+        ('v5_f32_f64', 'float32', 'float64', 'v5', None),  # f32 storage, f64 recurrence
+        ('v5_f32_f32', 'float32', 'float32', 'v5', None),  # Full float32
+        # v6 configurations (DFT - default)
+        ('v6_f64_f64', 'float64', 'float64', 'v6', PHASE1_DFT),  # Full float64
+        ('v6_f32_f64', 'float32', 'float64', 'v6', PHASE1_DFT),  # f32 storage, f64 recurrence
+        ('v6_f32_f32', 'float32', 'float32', 'v6', PHASE1_DFT),  # Full float32
+        # v6 configurations (Bluestein FFT)
+        ('v6_f64_f64_bluestein', 'float64', 'float64', 'v6', PHASE1_BLUESTEIN),  # Full float64 + Bluestein
+        ('v6_f32_f32_bluestein', 'float32', 'float32', 'v6', PHASE1_BLUESTEIN),  # Full float32 + Bluestein
+    ]
+
+    for name, storage, recurrence, version, phase1_method in cuda_configs:
+        method_str = " + Bluestein" if phase1_method == PHASE1_BLUESTEIN else ""
+        print(f"Benchmarking CUDA {version} ({storage} storage, {recurrence} recurrence{method_str})...")
+        try:
+            mean, std = benchmark_cuda(nside, l_max, n_iterations,
+                                       storage_precision=storage,
+                                       recurrence_precision=recurrence,
+                                       version=version,
+                                       phase1_method=phase1_method)
+            results[name] = (mean, std)
+            print(f"  {name}: {mean*1000:.2f} ± {std*1000:.2f} ms")
+        except Exception as e:
+            print(f"  {name}: FAILED ({e})")
+            results[name] = None
+
+    # JAX benchmarks
+    for dtype_name in ['bfloat16', 'float32', 'float64']:
+        print(f"Benchmarking JAX ({dtype_name})...")
+        try:
+            jax_mean, jax_std = benchmark_jax(nside, l_max, n_iterations, dtype_name)
+            results[f'jax_{dtype_name}'] = (jax_mean, jax_std)
+            print(f"  JAX {dtype_name}: {jax_mean*1000:.2f} ± {jax_std*1000:.2f} ms")
+        except Exception as e:
+            print(f"  JAX {dtype_name}: FAILED ({e})")
+            results[f'jax_{dtype_name}'] = None
+
+    # Print summary table
+    print()
+    print("=" * 80)
+    print("Summary")
+    print("=" * 80)
+    print(f"{'Implementation':<20} {'Time (ms)':<18} {'Speedup vs JAX f64':<20}")
+    print("-" * 80)
+
+    # Get JAX float64 as baseline
+    baseline = results.get('jax_float64')
+    baseline_time = baseline[0] if baseline else None
+
+    # Sort by time for nice display
+    sorted_results = sorted(
+        [(k, v) for k, v in results.items() if v is not None],
+        key=lambda x: x[1][0]
+    )
+
+    for name, result in sorted_results:
+        mean, std = result
+        time_str = f"{mean*1000:.2f} ± {std*1000:.2f}"
+        if baseline_time:
+            speedup = baseline_time / mean
+            speedup_str = f"{speedup:.2f}x"
+        else:
+            speedup_str = "-"
+        print(f"{name:<20} {time_str:<18} {speedup_str:<20}")
+
+    # Print failed ones at the end
+    for name, result in results.items():
+        if result is None:
+            print(f"{name:<20} {'FAILED':<18} {'-':<20}")
+
+    print("=" * 80)
+
+    # Print precision notes
+    print()
+    print("Precision configurations:")
+    print("  cuda_f64_f64: Highest accuracy (double for everything)")
+    print("  cuda_f64_f32: Double storage, float32 Ylm recurrence")
+    print("  cuda_f32_f64: Float32 storage, double Ylm recurrence (balanced)")
+    print("  cuda_f32_f32: Fastest, lowest accuracy (may have issues at high l)")
+    print()
+
+    return results
+
+
+def main():
+    nside = int(sys.argv[1]) if len(sys.argv) > 1 else NSIDE
+    n_iterations = int(sys.argv[2]) if len(sys.argv) > 2 else N_ITERATIONS
+
+    run_benchmark(nside, n_iterations)
+
+
+if __name__ == "__main__":
+    main()

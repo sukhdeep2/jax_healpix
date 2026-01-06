@@ -56,23 +56,16 @@ int spht_alm2map(spht_context_t* ctx, int n_maps,
                  const complex_t* alm_in, real_t* map_out);
 
 /**
- * Standalone map2alm (no context needed)
+ * Standalone map2alm v6 (no context needed)
  */
-void map2alm_cuda(int nside, int l_max, int n_maps,
-                  const real_t* map_in, complex_t* alm_out);
+void map2alm_cuda_v6(int nside, int l_max, int n_maps,
+                      const real_t* map_in, complex_t* alm_out);
 
 /**
- * Optimized map2alm using cuFFT and cuBLAS
- * Same interface as map2alm_cuda
+ * Standalone alm2map v6 (no context needed)
  */
-void map2alm_cuda_v2(int nside, int l_max, int n_maps,
-                     const real_t* map_in, complex_t* alm_out);
-
-/**
- * Standalone alm2map (no context needed)
- */
-void alm2map_cuda(int nside, int l_max, int n_maps,
-                  const complex_t* alm_in, real_t* map_out);
+void alm2map_cuda_v6(int nside, int l_max, int n_maps,
+                      const complex_t* alm_in, real_t* map_out);
 
 /**
  * Allocate device memory for maps

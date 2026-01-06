@@ -46,7 +46,7 @@ int test_uniform_map() {
     spht_map_to_device(nside, n_maps, h_map, d_map);
 
     // Run transform
-    map2alm_cuda(nside, l_max, n_maps, d_map, d_alm);
+    map2alm_cuda_v6(nside, l_max, n_maps, d_map, d_alm);
 
     // Copy back
     spht_alm_to_host(l_max, n_maps, d_alm, h_alm);
@@ -141,10 +141,10 @@ int test_roundtrip() {
     spht_map_to_device(nside, n_maps, h_map_in, d_map_in);
 
     // Forward transform: map -> alm
-    map2alm_cuda(nside, l_max, n_maps, d_map_in, d_alm);
+    map2alm_cuda_v6(nside, l_max, n_maps, d_map_in, d_alm);
 
     // Inverse transform: alm -> map
-    alm2map_cuda(nside, l_max, n_maps, d_alm, d_map_out);
+    alm2map_cuda_v6(nside, l_max, n_maps, d_alm, d_map_out);
 
     // Copy result back
     spht_map_to_host(nside, n_maps, d_map_out, h_map_out);

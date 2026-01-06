@@ -1,72 +1,59 @@
 /**
- * Bluestein FFT (Chirp-Z Transform) for HEALPix ring processing
+ * Unified Bluestein FFT (Chirp-Z Transform) Module
  *
- * Public header declaring kernels and utility functions for both
- * forward (map2alm) and inverse (alm2map) transforms.
- *
- * This header provides the public API. Implementation is in src/bluestein/
+ * Internal header for the modularized Bluestein FFT implementation.
+ * Provides forward DFT (map→Gm) and inverse DFT (Fmy→map) via the
+ * Bluestein algorithm, which converts arbitrary-size DFT to convolution.
  */
 
-#ifndef BLUESTEIN_FFT_H
-#define BLUESTEIN_FFT_H
+#ifndef BLUESTEIN_FFT_CUH
+#define BLUESTEIN_FFT_CUH
 
 #include <cuda_runtime.h>
 #include <cufft.h>
-#include "precision_traits.cuh"
-#include "ring_geometry.cuh"
+#include "../../include/precision_traits.cuh"
+#include "../../include/ring_geometry.cuh"
 
 // ============================================================================
 // Utility functions
 // ============================================================================
 
-/**
- * Compute next power of 2 >= n.
- */
 __host__ __device__ inline int next_power_of_2(int n) {
     int p = 1;
     while (p < n) p <<= 1;
     return p;
 }
 
-/**
- * Compute Bluestein FFT size M >= 2*N - 1 (power of 2).
- */
 __host__ __device__ inline int get_bluestein_fft_size(int max_ring_size) {
     return next_power_of_2(2 * max_ring_size - 1);
 }
 
-/**
- * Get or create a cached cuFFT plan (thread-safe).
- */
+// ============================================================================
+// cuFFT Plan Cache
+// ============================================================================
+
 cufftHandle get_cached_cufft_plan(int size, int batch, cufftType type);
-
-/**
- * Legacy alias for get_cached_cufft_plan (deprecated).
- */
-cufftHandle get_cached_fft_plan(int size, int batch, cufftType type);
-
-/**
- * Clear all cached cuFFT plans.
- */
+cufftHandle get_cached_fft_plan(int size, int batch, cufftType type);  // Legacy alias
 void clear_cufft_plan_cache();
 
 // ============================================================================
-// Shared kernels: Conjugate chirp and pointwise multiplication
+// Conjugate Chirp Computation - precision-specific kernels
 // ============================================================================
 
-// Double precision conjugate chirp
 __global__ void bluestein_compute_conj_chirp_f64(
     int nside, int M,
     cufftDoubleComplex* __restrict__ conj_chirp_fft
 );
 
-// Float precision conjugate chirp
 __global__ void bluestein_compute_conj_chirp_f32(
     int nside, int M,
     cufftComplex* __restrict__ conj_chirp_fft
 );
 
-// Double precision pointwise multiply
+// ============================================================================
+// Pointwise Multiplication - precision-specific kernels
+// ============================================================================
+
 __global__ void bluestein_pointwise_mult_f64(
     int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -74,7 +61,6 @@ __global__ void bluestein_pointwise_mult_f64(
     const cufftDoubleComplex* __restrict__ conj_chirp_fft
 );
 
-// Float precision pointwise multiply
 __global__ void bluestein_pointwise_mult_f32(
     int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -83,11 +69,10 @@ __global__ void bluestein_pointwise_mult_f32(
 );
 
 // ============================================================================
-// Forward Bluestein (map2alm): map pixels -> Fourier coefficients Gm
-// Naming: _<output_precision>_<fft_precision>
+// Forward Bluestein: map pixels -> Gm
 // ============================================================================
 
-// double output, double FFT
+// Double precision map input, double complex FFT
 __global__ void bluestein_forward_pre_chirp_f64_f64(
     int nside, int n_maps, int n_rings, int M,
     const double* __restrict__ map_in,
@@ -95,7 +80,7 @@ __global__ void bluestein_forward_pre_chirp_f64_f64(
     int* __restrict__ ring_sizes_out
 );
 
-// float output, double FFT
+// Float precision map input, double complex FFT
 __global__ void bluestein_forward_pre_chirp_f32_f64(
     int nside, int n_maps, int n_rings, int M,
     const float* __restrict__ map_in,
@@ -103,7 +88,7 @@ __global__ void bluestein_forward_pre_chirp_f32_f64(
     int* __restrict__ ring_sizes_out
 );
 
-// double output, float FFT
+// Double precision map input, float complex FFT
 __global__ void bluestein_forward_pre_chirp_f64_f32(
     int nside, int n_maps, int n_rings, int M,
     const double* __restrict__ map_in,
@@ -111,7 +96,7 @@ __global__ void bluestein_forward_pre_chirp_f64_f32(
     int* __restrict__ ring_sizes_out
 );
 
-// float output, float FFT
+// Float precision map input, float complex FFT
 __global__ void bluestein_forward_pre_chirp_f32_f32(
     int nside, int n_maps, int n_rings, int M,
     const float* __restrict__ map_in,
@@ -119,7 +104,7 @@ __global__ void bluestein_forward_pre_chirp_f32_f32(
     int* __restrict__ ring_sizes_out
 );
 
-// Extract Gm kernels
+// Extract Gm from double complex IFFT, double output
 __global__ void bluestein_forward_extract_gm_f64_f64(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -130,6 +115,7 @@ __global__ void bluestein_forward_extract_gm_f64_f64(
     double* __restrict__ Gm_odd_im
 );
 
+// Extract Gm from double complex IFFT, float output
 __global__ void bluestein_forward_extract_gm_f32_f64(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -140,6 +126,7 @@ __global__ void bluestein_forward_extract_gm_f32_f64(
     float* __restrict__ Gm_odd_im
 );
 
+// Extract Gm from float complex IFFT, double output
 __global__ void bluestein_forward_extract_gm_f64_f32(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -150,6 +137,7 @@ __global__ void bluestein_forward_extract_gm_f64_f32(
     double* __restrict__ Gm_odd_im
 );
 
+// Extract Gm from float complex IFFT, float output
 __global__ void bluestein_forward_extract_gm_f32_f32(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -161,11 +149,10 @@ __global__ void bluestein_forward_extract_gm_f32_f32(
 );
 
 // ============================================================================
-// Inverse Bluestein (alm2map): Fourier coefficients Fmy -> map pixels
-// Naming: _<output_precision>_<fft_precision>
+// Inverse Bluestein: Fmy -> map pixels
 // ============================================================================
 
-// Pre-chirp kernels
+// Double Fmy input, double complex FFT
 __global__ void bluestein_inverse_pre_chirp_f64_f64(
     int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
     const double* __restrict__ Fmy_re,
@@ -174,6 +161,7 @@ __global__ void bluestein_inverse_pre_chirp_f64_f64(
     int* __restrict__ ring_sizes_out
 );
 
+// Float Fmy input, double complex FFT
 __global__ void bluestein_inverse_pre_chirp_f32_f64(
     int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
     const float* __restrict__ Fmy_re,
@@ -182,6 +170,7 @@ __global__ void bluestein_inverse_pre_chirp_f32_f64(
     int* __restrict__ ring_sizes_out
 );
 
+// Double Fmy input, float complex FFT
 __global__ void bluestein_inverse_pre_chirp_f64_f32(
     int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
     const double* __restrict__ Fmy_re,
@@ -190,6 +179,7 @@ __global__ void bluestein_inverse_pre_chirp_f64_f32(
     int* __restrict__ ring_sizes_out
 );
 
+// Float Fmy input, float complex FFT
 __global__ void bluestein_inverse_pre_chirp_f32_f32(
     int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
     const float* __restrict__ Fmy_re,
@@ -198,7 +188,7 @@ __global__ void bluestein_inverse_pre_chirp_f32_f32(
     int* __restrict__ ring_sizes_out
 );
 
-// Extract map kernels
+// Extract map from double complex IFFT, double output
 __global__ void bluestein_inverse_extract_map_f64_f64(
     int nside, int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -206,6 +196,7 @@ __global__ void bluestein_inverse_extract_map_f64_f64(
     double* __restrict__ map_out
 );
 
+// Extract map from double complex IFFT, float output
 __global__ void bluestein_inverse_extract_map_f32_f64(
     int nside, int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -213,6 +204,7 @@ __global__ void bluestein_inverse_extract_map_f32_f64(
     float* __restrict__ map_out
 );
 
+// Extract map from float complex IFFT, double output
 __global__ void bluestein_inverse_extract_map_f64_f32(
     int nside, int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -220,6 +212,7 @@ __global__ void bluestein_inverse_extract_map_f64_f32(
     double* __restrict__ map_out
 );
 
+// Extract map from float complex IFFT, float output
 __global__ void bluestein_inverse_extract_map_f32_f32(
     int nside, int n_maps, int n_rings, int M,
     const int* __restrict__ ring_sizes,
@@ -227,14 +220,4 @@ __global__ void bluestein_inverse_extract_map_f32_f32(
     float* __restrict__ map_out
 );
 
-// ============================================================================
-// Legacy compatibility aliases (deprecated, use explicit precision names)
-// ============================================================================
-
-// Map old names to new precision-specific kernels
-#define bluestein_compute_conj_chirp_kernel_v2 bluestein_compute_conj_chirp_f64
-#define bluestein_compute_conj_chirp_kernel_f32_v2 bluestein_compute_conj_chirp_f32
-#define bluestein_pointwise_mult_kernel_v2 bluestein_pointwise_mult_f64
-#define bluestein_pointwise_mult_kernel_f32_v2 bluestein_pointwise_mult_f32
-
-#endif // BLUESTEIN_FFT_H
+#endif // BLUESTEIN_FFT_CUH
