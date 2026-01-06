@@ -191,18 +191,19 @@ __device__ __forceinline__ void compute_ring_geom_v6(
 }
 
 // ============================================================================
-// Phase 1: Compute Gm_even and Gm_odd for all (ring_pair, m)
+// Phase 1: Compute Gm_north and Gm_south for all (ring_pair, m)
 // Each block handles one north ring pair, threads handle m values
+// North/South separation allows Phase 2 to load half the data at a time
 // ============================================================================
 
 template<typename T, typename R>
 __global__ void compute_gm_kernel_v6(
     int nside, int l_max, int n_maps, int n_rings,
     const T* __restrict__ map_in,
-    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings] - optimized for coalesced reads
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im,
+    R* __restrict__ Gm_north_re,   // [n_maps, lp1, n_north_rings] - optimized for coalesced reads
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im,
     R* __restrict__ cos_theta_out,  // [n_north_rings]
     R* __restrict__ sin_theta_out
 ) {
@@ -276,15 +277,13 @@ __global__ void compute_gm_kernel_v6(
                 }
             }
 
-            // Combine with N-S symmetry
-            // Gm_even = Gm_n + Gm_s (for even l+m)
-            // Gm_odd  = Gm_n - Gm_s (for odd l+m)
+            // Store north and south separately (combination done in Phase 2)
             // Layout: [n_maps, lp1, n_north_rings] for coalesced reads in Phase 2
             size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-            Gm_even_re[idx] = R(gn_re + gs_re);
-            Gm_even_im[idx] = R(gn_im + gs_im);
-            Gm_odd_re[idx]  = R(gn_re - gs_re);
-            Gm_odd_im[idx]  = R(gn_im - gs_im);
+            Gm_north_re[idx] = R(gn_re);
+            Gm_north_im[idx] = R(gn_im);
+            Gm_south_re[idx] = R(gs_re);
+            Gm_south_im[idx] = R(gs_im);
         }
     }
 }
@@ -299,10 +298,10 @@ template<typename T, typename R>
 __global__ void compute_gm_polar_dft_kernel(
     int nside, int l_max, int n_maps, int n_rings,
     const T* __restrict__ map_in,
-    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings]
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im,
+    R* __restrict__ Gm_north_re,   // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im,
     R* __restrict__ cos_theta_out,  // [n_north_rings]
     R* __restrict__ sin_theta_out
 ) {
@@ -371,20 +370,20 @@ __global__ void compute_gm_polar_dft_kernel(
                 gs_im += val * s;
             }
 
-            // Combine with N-S symmetry
+            // Store north and south separately (combination done in Phase 2)
             // Layout: [n_maps, lp1, n_north_rings]
             size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-            Gm_even_re[idx] = R(gn_re + gs_re);
-            Gm_even_im[idx] = R(gn_im + gs_im);
-            Gm_odd_re[idx]  = R(gn_re - gs_re);
-            Gm_odd_im[idx]  = R(gn_im - gs_im);
+            Gm_north_re[idx] = R(gn_re);
+            Gm_north_im[idx] = R(gn_im);
+            Gm_south_re[idx] = R(gs_re);
+            Gm_south_im[idx] = R(gs_im);
         }
     }
 }
 
 // ============================================================================
 // Hybrid FFT/DFT: Equatorial FFT phase correction and combination kernel
-// Applies exp(-i*m*phi_0) phase correction and combines N/S pairs
+// Applies exp(-i*m*phi_0) phase correction and stores N/S separately
 // ============================================================================
 
 // Double precision FFT version of phase correction kernel
@@ -397,10 +396,10 @@ __global__ void equatorial_phase_combine_kernel(
     int n_equatorial,  // 2*nside+1 rings
     const cufftDoubleComplex* __restrict__ fft_out,  // [n_maps, n_equatorial, fft_out_size]
     const double* __restrict__ phi_0,    // [n_equatorial] - double for f64 FFT
-    R* __restrict__ Gm_even_re,     // [n_maps, lp1, n_north_rings]
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im,
+    R* __restrict__ Gm_north_re,     // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im,
     R* __restrict__ cos_theta_out,  // [n_north_rings]
     R* __restrict__ sin_theta_out
 ) {
@@ -460,27 +459,19 @@ __global__ void equatorial_phase_combine_kernel(
         double gs_re = fft_val_s.x * cos_s - fft_val_s.y * sin_s;
         double gs_im = fft_val_s.x * sin_s + fft_val_s.y * cos_s;
 
-        // Combine N/S with symmetry
-        R even_re, even_im, odd_re, odd_im;
-        if (is_equator) {
-            // Equator: only one ring, no south partner
-            even_re = R(gn_re);
-            even_im = R(gn_im);
-            odd_re = R(0);
-            odd_im = R(0);
-        } else {
-            even_re = R(gn_re + gs_re);
-            even_im = R(gn_im + gs_im);
-            odd_re  = R(gn_re - gs_re);
-            odd_im  = R(gn_im - gs_im);
-        }
+        // Store N/S separately (combination done in Phase 2)
+        // Equator: south = 0 (no south partner)
+        R north_re = R(gn_re);
+        R north_im = R(gn_im);
+        R south_re = is_equator ? R(0) : R(gs_re);
+        R south_im = is_equator ? R(0) : R(gs_im);
 
         // Output layout: [n_maps, lp1, n_north_rings]
         size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-        Gm_even_re[idx] = even_re;
-        Gm_even_im[idx] = even_im;
-        Gm_odd_re[idx]  = odd_re;
-        Gm_odd_im[idx]  = odd_im;
+        Gm_north_re[idx] = north_re;
+        Gm_north_im[idx] = north_im;
+        Gm_south_re[idx] = south_re;
+        Gm_south_im[idx] = south_im;
     }
 
     // Store geometry (only once per north_ring, thread 0 of m=0, map=0)
@@ -509,10 +500,10 @@ __global__ void equatorial_phase_combine_kernel_f32(
     int n_equatorial,  // 2*nside+1 rings
     const cufftComplex* __restrict__ fft_out,  // [n_maps, n_equatorial, fft_out_size]
     const float* __restrict__ phi_0,    // [n_equatorial] - float for f32 FFT
-    R* __restrict__ Gm_even_re,
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im,
+    R* __restrict__ Gm_north_re,
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im,
     R* __restrict__ cos_theta_out,
     R* __restrict__ sin_theta_out
 ) {
@@ -562,24 +553,17 @@ __global__ void equatorial_phase_combine_kernel_f32(
         float gs_re = fft_val_s.x * cos_s - fft_val_s.y * sin_s;
         float gs_im = fft_val_s.x * sin_s + fft_val_s.y * cos_s;
 
-        R even_re, even_im, odd_re, odd_im;
-        if (is_equator) {
-            even_re = R(gn_re);
-            even_im = R(gn_im);
-            odd_re = R(0);
-            odd_im = R(0);
-        } else {
-            even_re = R(gn_re + gs_re);
-            even_im = R(gn_im + gs_im);
-            odd_re  = R(gn_re - gs_re);
-            odd_im  = R(gn_im - gs_im);
-        }
+        // Store N/S separately (combination done in Phase 2)
+        R north_re = R(gn_re);
+        R north_im = R(gn_im);
+        R south_re = is_equator ? R(0) : R(gs_re);
+        R south_im = is_equator ? R(0) : R(gs_im);
 
         size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-        Gm_even_re[idx] = even_re;
-        Gm_even_im[idx] = even_im;
-        Gm_odd_re[idx]  = odd_re;
-        Gm_odd_im[idx]  = odd_im;
+        Gm_north_re[idx] = north_re;
+        Gm_north_im[idx] = north_im;
+        Gm_south_re[idx] = south_re;
+        Gm_south_im[idx] = south_im;
     }
 
     if (m == 0 && map_idx == 0) {
@@ -854,17 +838,17 @@ __global__ void bluestein_pointwise_mult_kernel_f32(
 }
 
 // Kernel to extract Gm values from Bluestein result with post-chirp and phase correction
-// Also combines N/S ring pairs
+// Stores N/S separately for Phase 2 sequential loading
 template<typename R>
 __global__ void bluestein_extract_gm_kernel(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
     int M,
     const int* __restrict__ ring_sizes,
     const cufftDoubleComplex* __restrict__ ifft_data,  // [n_maps, n_rings, M]
-    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings]
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im
+    R* __restrict__ Gm_north_re,   // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im
 ) {
     // Grid: blockIdx.x = north_ring, blockIdx.y = map
     int north_ring = blockIdx.x;
@@ -961,12 +945,12 @@ __global__ void bluestein_extract_gm_kernel(
             gs_im = gs_re_raw * phase_s_south + gs_im_raw * phase_c_south;
         }
 
-        // Combine N/S with symmetry
+        // Store N/S separately (combination done in Phase 2)
         size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-        Gm_even_re[idx] = R(gn_re + gs_re);
-        Gm_even_im[idx] = R(gn_im + gs_im);
-        Gm_odd_re[idx]  = R(gn_re - gs_re);
-        Gm_odd_im[idx]  = R(gn_im - gs_im);
+        Gm_north_re[idx] = R(gn_re);
+        Gm_north_im[idx] = R(gn_im);
+        Gm_south_re[idx] = R(gs_re);
+        Gm_south_im[idx] = R(gs_im);
     }
 }
 
@@ -977,10 +961,10 @@ __global__ void bluestein_extract_gm_kernel_f32(
     int M,
     const int* __restrict__ ring_sizes,
     const cufftComplex* __restrict__ ifft_data,
-    R* __restrict__ Gm_even_re,
-    R* __restrict__ Gm_even_im,
-    R* __restrict__ Gm_odd_re,
-    R* __restrict__ Gm_odd_im
+    R* __restrict__ Gm_north_re,
+    R* __restrict__ Gm_north_im,
+    R* __restrict__ Gm_south_re,
+    R* __restrict__ Gm_south_im
 ) {
     int north_ring = blockIdx.x;
     int map_idx = blockIdx.y;
@@ -1063,18 +1047,19 @@ __global__ void bluestein_extract_gm_kernel_f32(
             gs_im = gs_re_raw * phase_s_south + gs_im_raw * phase_c_south;
         }
 
+        // Store N/S separately (combination done in Phase 2)
         size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-        Gm_even_re[idx] = R(gn_re + gs_re);
-        Gm_even_im[idx] = R(gn_im + gs_im);
-        Gm_odd_re[idx]  = R(gn_re - gs_re);
-        Gm_odd_im[idx]  = R(gn_im - gs_im);
+        Gm_north_re[idx] = R(gn_re);
+        Gm_north_im[idx] = R(gn_im);
+        Gm_south_re[idx] = R(gs_re);
+        Gm_south_im[idx] = R(gs_im);
     }
 }
 
 // ============================================================================
 // Phase 2: Reduce to alm using warp-per-m with ring batching and multi-map
-// One warp per m value, processes rings in batches to fit shared memory
-// Ylm is computed once and reused across all maps in parallel
+// Uses sequential north/south loading to halve shared memory per map
+// Ylm is computed once per l and reused for both north and south passes
 // ============================================================================
 
 // Default ring batch size for v6 - can be reduced for multi-map
@@ -1082,20 +1067,21 @@ __global__ void bluestein_extract_gm_kernel_f32(
 #define RING_BATCH_SIZE 256
 
 // Maximum maps that can be processed in parallel (shared memory limited)
-// Shared mem layout: geometry (2 arrays, shared) + Gm (4 arrays per map)
-// f64: 2*256*8 + N*4*256*8 <= 48KB -> N <= 5
-// f32: 2*256*4 + N*4*256*4 <= 48KB -> N <= 11
-#define MAX_PARALLEL_MAPS_F64 5
-#define MAX_PARALLEL_MAPS_F32 11
+// Shared mem layout: geometry (2 arrays, shared) + Gm (2 arrays per map for N or S)
+// With sequential N/S loading, we only need 2 Gm arrays per map at a time
+// f64: 2*256*8 + N*2*256*8 <= 48KB -> N <= 11
+// f32: 2*256*4 + N*2*256*4 <= 48KB -> N <= 23
+#define MAX_PARALLEL_MAPS_F64 11
+#define MAX_PARALLEL_MAPS_F32 23
 
 template<typename T, typename R>
 __global__ void reduce_to_alm_kernel_v6(
     int nside, int l_max, int n_maps, int n_north_rings,
     int ring_batch_size, int n_maps_parallel,  // configurable parameters
-    const R* __restrict__ Gm_even_re,
-    const R* __restrict__ Gm_even_im,
-    const R* __restrict__ Gm_odd_re,
-    const R* __restrict__ Gm_odd_im,
+    const R* __restrict__ Gm_north_re,
+    const R* __restrict__ Gm_north_im,
+    const R* __restrict__ Gm_south_re,
+    const R* __restrict__ Gm_south_im,
     const R* __restrict__ cos_theta,
     const R* __restrict__ sin_theta,
     R pix_area,
@@ -1112,22 +1098,23 @@ __global__ void reduce_to_alm_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
-    // Shared memory layout:
+    // Shared memory layout (sequential N/S loading):
     // - Geometry (shared across maps): cos_theta, sin_theta [2 * ring_batch_size]
-    // - Gm per map: Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im [4 * ring_batch_size each]
+    // - Gm per map: only 2 arrays at a time (north OR south) [2 * ring_batch_size each]
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
-    // Gm arrays for parallel maps (4 arrays per map)
+    // Gm arrays for parallel maps (2 arrays per map - half of before!)
     R* sh_Gm_base = sh_sin_th + ring_batch_size;
 
     // Per-lane Ylm recurrence state (local memory, L1 cached)
     C Ylm_prev1[MAX_RINGS_PER_LANE];
     C Ylm_prev2[MAX_RINGS_PER_LANE];
+    // Save initial Ymm for restoring between north/south passes
+    C Ymm_saved[MAX_RINGS_PER_LANE];
 
     // Per-lane accumulators for each parallel map
-    // We'll process maps in groups of n_maps_parallel
-    C sum_re[MAX_PARALLEL_MAPS_F32];  // Use max possible for static allocation
+    C sum_re[MAX_PARALLEL_MAPS_F32];
     C sum_im[MAX_PARALLEL_MAPS_F32];
 
     // Process maps in batches of n_maps_parallel
@@ -1140,30 +1127,11 @@ __global__ void reduce_to_alm_kernel_v6(
             int batch_end = min(batch_start + ring_batch_size, n_north_rings);
             int batch_size = batch_end - batch_start;
 
-            // Cooperative load of geometry (shared across all maps)
+            // Cooperative load of geometry (shared across all maps, stays for both N/S passes)
             for (int r = lane; r < batch_size; r += 32) {
                 int global_r = batch_start + r;
                 sh_cos_th[r] = cos_theta[global_r];
                 sh_sin_th[r] = sin_theta[global_r];
-            }
-
-            // Cooperative load of Gm for all maps in this batch
-            // Gm layout: [n_maps, lp1, n_north_rings] - consecutive rings are consecutive in memory
-            for (int t = 0; t < n_maps_in_batch; t++) {
-                int global_t = map_batch_start + t;
-                // Base index for this map and m value
-                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
-                R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;  // 4 Gm arrays per map
-
-                for (int r = lane; r < batch_size; r += 32) {
-                    int global_r = batch_start + r;
-                    // Now consecutive threads access consecutive memory (coalesced!)
-                    size_t idx = base_idx + global_r;
-                    sh_Gm_t[0 * ring_batch_size + r] = Gm_even_re[idx];
-                    sh_Gm_t[1 * ring_batch_size + r] = Gm_even_im[idx];
-                    sh_Gm_t[2 * ring_batch_size + r] = Gm_odd_re[idx];
-                    sh_Gm_t[3 * ring_batch_size + r] = Gm_odd_im[idx];
-                }
             }
             __syncwarp();
 
@@ -1173,7 +1141,7 @@ __global__ void reduce_to_alm_kernel_v6(
             int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
             k_end = min(k_end, n_my_rings_total);
 
-            // Initialize Y[m,m] for rings in this batch
+            // Compute and save initial Y[m,m] for rings in this batch
             for (int k = k_start; k < k_end; k++) {
                 int global_r = lane + 32 * k;
                 int local_r = global_r - batch_start;
@@ -1184,20 +1152,34 @@ __global__ void reduce_to_alm_kernel_v6(
                     Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
                 }
 
+                Ymm_saved[k] = Ymm;  // Save for south pass
                 Ylm_prev1[k] = Ymm;
                 Ylm_prev2[k] = C(0);
             }
 
-            // Process l = m to l_max for this batch
-            // Ylm computed once, reused for all maps in parallel
+            // ================================================================
+            // NORTH PASS: Load Gm_north, accumulate
+            // ================================================================
+            for (int t = 0; t < n_maps_in_batch; t++) {
+                int global_t = map_batch_start + t;
+                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
+                R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;  // 2 arrays per map
+
+                for (int r = lane; r < batch_size; r += 32) {
+                    size_t idx = base_idx + batch_start + r;
+                    sh_Gm_t[0 * ring_batch_size + r] = Gm_north_re[idx];
+                    sh_Gm_t[1 * ring_batch_size + r] = Gm_north_im[idx];
+                }
+            }
+            __syncwarp();
+
+            // Process l = m to l_max for north pass
             for (int l = m; l <= l_max; l++) {
-                // Reset accumulators for all maps
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     sum_re[t] = C(0);
                     sum_im[t] = C(0);
                 }
 
-                // Precompute l-dependent recurrence coefficients (outside ring loop)
                 C recur_A = C(0), recur_B = C(0), recur_C = C(0);
                 if (l == m + 1) {
                     recur_C = Traits::sqrt_d(C(2*m + 3));
@@ -1208,16 +1190,13 @@ __global__ void reduce_to_alm_kernel_v6(
                     recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
                     recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
                 }
-                int parity = (l + m) & 1;
 
-                // Accumulate across rings (Ylm computed once)
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
                     int local_r = global_r - batch_start;
                     C cos_th = C(sh_cos_th[local_r]);
                     C Ylm;
 
-                    // Compute Ylm (same for all maps)
                     if (l == m) {
                         Ylm = Ylm_prev1[k];
                     } else if (l == m + 1) {
@@ -1230,23 +1209,16 @@ __global__ void reduce_to_alm_kernel_v6(
                         Ylm_prev1[k] = Ylm;
                     }
 
-                    // Accumulate Ylm * Gm for each map (reuse Ylm)
                     for (int t = 0; t < n_maps_in_batch; t++) {
-                        R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
-                        C gm_re, gm_im;
-                        if (parity) {
-                            gm_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);  // odd_re
-                            gm_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);  // odd_im
-                        } else {
-                            gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);  // even_re
-                            gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);  // even_im
-                        }
+                        R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
+                        C gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                        C gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
                         sum_re[t] += Ylm * gm_re;
                         sum_im[t] += Ylm * gm_im;
                     }
                 }
 
-                // Warp-level reduction and output for each map
+                // Warp reduce and output north contribution
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     C sr = sum_re[t];
                     C si = sum_im[t];
@@ -1272,6 +1244,100 @@ __global__ void reduce_to_alm_kernel_v6(
                     }
                 }
             }
+
+            // ================================================================
+            // SOUTH PASS: Restore Ylm, load Gm_south, accumulate with sign
+            // ================================================================
+            // Restore Ylm state
+            for (int k = k_start; k < k_end; k++) {
+                Ylm_prev1[k] = Ymm_saved[k];
+                Ylm_prev2[k] = C(0);
+            }
+
+            // Load Gm_south (reusing same shared memory)
+            for (int t = 0; t < n_maps_in_batch; t++) {
+                int global_t = map_batch_start + t;
+                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
+                R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
+
+                for (int r = lane; r < batch_size; r += 32) {
+                    size_t idx = base_idx + batch_start + r;
+                    sh_Gm_t[0 * ring_batch_size + r] = Gm_south_re[idx];
+                    sh_Gm_t[1 * ring_batch_size + r] = Gm_south_im[idx];
+                }
+            }
+            __syncwarp();
+
+            // Process l = m to l_max for south pass
+            for (int l = m; l <= l_max; l++) {
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    sum_re[t] = C(0);
+                    sum_im[t] = C(0);
+                }
+
+                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                if (l == m + 1) {
+                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                } else if (l > m + 1) {
+                    C l2 = C(l * l);
+                    C m2 = C(m * m);
+                    C lm1_2 = C((l-1) * (l-1));
+                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
+                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                }
+
+                // Sign for south: +1 if (l+m) even, -1 if odd
+                C sign = ((l + m) & 1) ? C(-1) : C(1);
+
+                for (int k = k_start; k < k_end; k++) {
+                    int global_r = lane + 32 * k;
+                    int local_r = global_r - batch_start;
+                    C cos_th = C(sh_cos_th[local_r]);
+                    C Ylm;
+
+                    if (l == m) {
+                        Ylm = Ylm_prev1[k];
+                    } else if (l == m + 1) {
+                        Ylm = cos_th * recur_C * Ylm_prev1[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    } else {
+                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    }
+
+                    for (int t = 0; t < n_maps_in_batch; t++) {
+                        R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
+                        C gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                        C gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
+                        // South contribution with parity sign
+                        sum_re[t] += sign * Ylm * gm_re;
+                        sum_im[t] += sign * Ylm * gm_im;
+                    }
+                }
+
+                // Warp reduce and ADD to alm (south contribution)
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    C sr = sum_re[t];
+                    C si = sum_im[t];
+
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2) {
+                        sr += __shfl_down_sync(0xffffffff, sr, offset);
+                        si += __shfl_down_sync(0xffffffff, si, offset);
+                    }
+
+                    if (lane == 0) {
+                        int global_t = map_batch_start + t;
+                        T* alm_re_t = alm_out_re + (size_t)global_t * lp1 * lp1;
+                        T* alm_im_t = alm_out_im + (size_t)global_t * lp1 * lp1;
+                        // Always add (north pass already wrote initial value)
+                        alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sr * C(pix_area));
+                        alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + si * C(pix_area));
+                    }
+                }
+            }
         }
     }
 }
@@ -1291,10 +1357,11 @@ void compute_v6_params(int n_maps, int* ring_batch_size, int* n_maps_parallel) {
     int batch = RING_BATCH_SIZE;  // 256
 
     // Calculate max parallel maps for default batch size
-    // Shared mem: geometry (2 arrays) + Gm (4 arrays per map)
-    // smem = 2 * batch * elem + n_par * 4 * batch * elem
-    // n_par = (MAX_SMEM / elem - 2 * batch) / (4 * batch)
-    int max_parallel = (MAX_SMEM / elem_size - 2 * batch) / (4 * batch);
+    // With sequential N/S loading, we only need 2 Gm arrays per map at a time
+    // Shared mem: geometry (2 arrays) + Gm (2 arrays per map)
+    // smem = 2 * batch * elem + n_par * 2 * batch * elem
+    // n_par = (MAX_SMEM / elem - 2 * batch) / (2 * batch)
+    int max_parallel = (MAX_SMEM / elem_size - 2 * batch) / (2 * batch);
 
     // Cap at compile-time maximum
     if (std::is_same<R, float>::value) {
@@ -1366,13 +1433,13 @@ void map2alm_cuda_v6_impl(
     size_t gm_size = (size_t)n_maps * n_north_rings * lp1 * sizeof(R);
     size_t geom_size = n_north_rings * sizeof(R);
 
-    R *Gm_even_re, *Gm_even_im, *Gm_odd_re, *Gm_odd_im;
+    R *Gm_north_re, *Gm_north_im, *Gm_south_re, *Gm_south_im;
     R *cos_theta, *sin_theta;
 
-    CUDA_CHECK(cudaMalloc(&Gm_even_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_even_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_odd_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_odd_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_north_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_north_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_south_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_south_im, gm_size));
     CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
@@ -1457,7 +1524,7 @@ void map2alm_cuda_v6_impl(
             bluestein_extract_gm_kernel<R><<<grid_extract, 256>>>(
                 nside, l_max, n_maps, n_rings, n_north_rings, M,
                 ring_sizes, chirped_data,
-                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im
+                Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im
             );
             CUDA_CHECK(cudaGetLastError());
 
@@ -1475,7 +1542,7 @@ void map2alm_cuda_v6_impl(
                 // Temporary: just use the DFT kernel to compute geometry
                 compute_gm_kernel_v6<T, R><<<n_north_rings, min(256, lp1)>>>(
                     nside, l_max, 0, n_rings, map_in,  // n_maps=0 to skip Gm computation
-                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
                     cos_theta, sin_theta
                 );
             }
@@ -1530,7 +1597,7 @@ void map2alm_cuda_v6_impl(
             bluestein_extract_gm_kernel_f32<R><<<grid_extract, 256>>>(
                 nside, l_max, n_maps, n_rings, n_north_rings, M,
                 ring_sizes, chirped_data,
-                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im
+                Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im
             );
             CUDA_CHECK(cudaGetLastError());
 
@@ -1542,7 +1609,7 @@ void map2alm_cuda_v6_impl(
                 // R is double but T is float - need conversion (unusual case)
                 compute_gm_kernel_v6<T, R><<<n_north_rings, min(256, lp1)>>>(
                     nside, l_max, 0, n_rings, map_in,
-                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
                     cos_theta, sin_theta
                 );
             }
@@ -1566,7 +1633,7 @@ void map2alm_cuda_v6_impl(
             int block_size_polar = min(256, lp1);
             compute_gm_polar_dft_kernel<T, R><<<n_polar_rings, block_size_polar>>>(
                 nside, l_max, n_maps, n_rings, map_in,
-                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
                 cos_theta, sin_theta
             );
             CUDA_CHECK(cudaGetLastError());
@@ -1645,14 +1712,14 @@ void map2alm_cuda_v6_impl(
                 equatorial_phase_combine_kernel<R><<<grid_phase, block_phase>>>(
                     nside, l_max, n_maps, fft_size, fft_out_size, n_equatorial,
                     (cufftDoubleComplex*)fft_out, (double*)eq_phi_0,
-                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
                     cos_theta, sin_theta
                 );
             } else {
                 equatorial_phase_combine_kernel_f32<R><<<grid_phase, block_phase>>>(
                     nside, l_max, n_maps, fft_size, fft_out_size, n_equatorial,
                     (cufftComplex*)fft_out, (float*)eq_phi_0,
-                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
                     cos_theta, sin_theta
                 );
             }
@@ -1676,7 +1743,7 @@ void map2alm_cuda_v6_impl(
         int block_size_p1 = min(256, lp1);
         compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
             nside, l_max, n_maps, n_rings, map_in,
-            Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+            Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
             cos_theta, sin_theta
         );
         CUDA_CHECK(cudaGetLastError());
@@ -1704,7 +1771,7 @@ skip_dft:
     reduce_to_alm_kernel_v6<T, R><<<lp1, 32, smem_size>>>(
         nside, l_max, n_maps, n_north_rings,
         ring_batch_size, n_maps_parallel,
-        Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+        Gm_north_re, Gm_north_im, Gm_south_re, Gm_south_im,
         cos_theta, sin_theta, pix_area,
         alm_out_re, alm_out_im
     );
@@ -1730,10 +1797,10 @@ skip_dft:
     }
 
     // Cleanup
-    cudaFree(Gm_even_re);
-    cudaFree(Gm_even_im);
-    cudaFree(Gm_odd_re);
-    cudaFree(Gm_odd_im);
+    cudaFree(Gm_north_re);
+    cudaFree(Gm_north_im);
+    cudaFree(Gm_south_re);
+    cudaFree(Gm_south_im);
     cudaFree(cos_theta);
     cudaFree(sin_theta);
 }
@@ -1891,6 +1958,7 @@ __device__ __forceinline__ C compute_alpha_lm(int l, int m) {
 
 // ============================================================================
 // Spin-2 Phase 2 kernel: Reduce to E,B alm with inline spin-2 Ylm computation
+// Sequential Q/U loading: halves shared memory (4 arrays instead of 8 per map)
 // Takes Gm for Q and U maps, outputs E and B alm coefficients
 // ============================================================================
 
@@ -1898,14 +1966,14 @@ template<typename T, typename R>
 __global__ void reduce_to_alm_spin2_kernel_v6(
     int nside, int l_max, int n_maps, int n_north_rings,
     int ring_batch_size, int n_maps_parallel,
-    const R* __restrict__ Gm_Q_even_re,   // Q map Gm [n_maps, lp1, n_north_rings]
-    const R* __restrict__ Gm_Q_even_im,
-    const R* __restrict__ Gm_Q_odd_re,
-    const R* __restrict__ Gm_Q_odd_im,
-    const R* __restrict__ Gm_U_even_re,   // U map Gm
-    const R* __restrict__ Gm_U_even_im,
-    const R* __restrict__ Gm_U_odd_re,
-    const R* __restrict__ Gm_U_odd_im,
+    const R* __restrict__ Gm_Q_north_re,   // Q map Gm [n_maps, lp1, n_north_rings]
+    const R* __restrict__ Gm_Q_north_im,
+    const R* __restrict__ Gm_Q_south_re,
+    const R* __restrict__ Gm_Q_south_im,
+    const R* __restrict__ Gm_U_north_re,   // U map Gm
+    const R* __restrict__ Gm_U_north_im,
+    const R* __restrict__ Gm_U_south_re,
+    const R* __restrict__ Gm_U_south_im,
     const R* __restrict__ cos_theta,
     const R* __restrict__ sin_theta,
     R pix_area,
@@ -1923,7 +1991,8 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
-    // Shared memory layout similar to spin-0 but with 8 Gm arrays per map (Q and U)
+    // Shared memory layout: geometry (2 arrays) + Gm (4 arrays per map for Q or U)
+    // With sequential Q/U loading, we only need 4 Gm arrays per map at a time
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
@@ -1932,14 +2001,15 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
     // Per-lane Ylm recurrence state
     C Ylm_prev1[MAX_RINGS_PER_LANE];
     C Ylm_prev2[MAX_RINGS_PER_LANE];
+    // Save initial Ylm state for U pass
+    C Ylm_saved1[MAX_RINGS_PER_LANE];
+    C Ylm_saved2[MAX_RINGS_PER_LANE];
 
-    // Accumulators for E and B modes (real and imag parts)
-    // E = Q×₂Y + i×U×₋₂Y → E_re = Q×₂Y, E_im = U×₋₂Y
-    // B = Q×₋₂Y + i×U×₂Y → B_re = Q×₋₂Y, B_im = U×₂Y
-    C sum_E_re[MAX_PARALLEL_MAPS_F64];
-    C sum_E_im[MAX_PARALLEL_MAPS_F64];
-    C sum_B_re[MAX_PARALLEL_MAPS_F64];
-    C sum_B_im[MAX_PARALLEL_MAPS_F64];
+    // Accumulators for E and B modes
+    C sum_E_re[MAX_PARALLEL_MAPS_F32];
+    C sum_E_im[MAX_PARALLEL_MAPS_F32];
+    C sum_B_re[MAX_PARALLEL_MAPS_F32];
+    C sum_B_im[MAX_PARALLEL_MAPS_F32];
 
     for (int map_batch_start = 0; map_batch_start < n_maps; map_batch_start += n_maps_parallel) {
         int map_batch_end = min(map_batch_start + n_maps_parallel, n_maps);
@@ -1949,33 +2019,11 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
             int batch_end = min(batch_start + ring_batch_size, n_north_rings);
             int batch_size = batch_end - batch_start;
 
-            // Load geometry
+            // Load geometry (shared across Q and U passes)
             for (int r = lane; r < batch_size; r += 32) {
                 int global_r = batch_start + r;
                 sh_cos_th[r] = cos_theta[global_r];
                 sh_sin_th[r] = sin_theta[global_r];
-            }
-
-            // Load Gm for Q and U maps (8 arrays per map)
-            for (int t = 0; t < n_maps_in_batch; t++) {
-                int global_t = map_batch_start + t;
-                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
-                R* sh_Gm_t = sh_Gm_base + t * 8 * ring_batch_size;
-
-                for (int r = lane; r < batch_size; r += 32) {
-                    int global_r = batch_start + r;
-                    size_t idx = base_idx + global_r;
-                    // Q map Gm
-                    sh_Gm_t[0 * ring_batch_size + r] = Gm_Q_even_re[idx];
-                    sh_Gm_t[1 * ring_batch_size + r] = Gm_Q_even_im[idx];
-                    sh_Gm_t[2 * ring_batch_size + r] = Gm_Q_odd_re[idx];
-                    sh_Gm_t[3 * ring_batch_size + r] = Gm_Q_odd_im[idx];
-                    // U map Gm
-                    sh_Gm_t[4 * ring_batch_size + r] = Gm_U_even_re[idx];
-                    sh_Gm_t[5 * ring_batch_size + r] = Gm_U_even_im[idx];
-                    sh_Gm_t[6 * ring_batch_size + r] = Gm_U_odd_re[idx];
-                    sh_Gm_t[7 * ring_batch_size + r] = Gm_U_odd_im[idx];
-                }
             }
             __syncwarp();
 
@@ -2000,19 +2048,16 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                     Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
                 }
 
-                // For m < 2, need to advance recurrence from l=m to l=l_start-1
-                // so that when we enter the l loop, Ylm_prev1 = Y[l_start-1,m], Ylm_prev2 = Y[l_start-2,m]
+                // Advance to l_start-1 for spin-2 (l >= 2)
                 C Yl_curr = Ymm;
                 C Yl_prev = C(0);
 
                 for (int l = m + 1; l < l_start; l++) {
                     if (l == m + 1) {
-                        // Y[m+1,m] = cos(theta) * sqrt(2m+3) * Y[m,m]
                         C Yl_new = cos_th * Traits::sqrt_d(C(2*m + 3)) * Yl_curr;
                         Yl_prev = Yl_curr;
                         Yl_curr = Yl_new;
                     } else {
-                        // Standard recurrence for l > m+1
                         C l2 = C(l * l);
                         C lm1_2 = C((l-1) * (l-1));
                         C m2 = C(m * m);
@@ -2026,9 +2071,33 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
 
                 Ylm_prev1[k] = Yl_curr;
                 Ylm_prev2[k] = Yl_prev;
+                // Save for U pass
+                Ylm_saved1[k] = Yl_curr;
+                Ylm_saved2[k] = Yl_prev;
             }
+
+            // ================================================================
+            // Q PASS: Load Q_north, Q_south, compute Q contributions
+            // E_re += Q × ₂Y (parity_s0), B_re += Q × ₋₂Y (parity_m2)
+            // E_im += Q × ₂Y (parity_s0), B_im += Q × ₋₂Y (parity_m2)
+            // ================================================================
+            for (int t = 0; t < n_maps_in_batch; t++) {
+                int global_t = map_batch_start + t;
+                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
+                R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
+
+                for (int r = lane; r < batch_size; r += 32) {
+                    size_t idx = base_idx + batch_start + r;
+                    sh_Gm_t[0 * ring_batch_size + r] = Gm_Q_north_re[idx];
+                    sh_Gm_t[1 * ring_batch_size + r] = Gm_Q_north_im[idx];
+                    sh_Gm_t[2 * ring_batch_size + r] = Gm_Q_south_re[idx];
+                    sh_Gm_t[3 * ring_batch_size + r] = Gm_Q_south_im[idx];
+                }
+            }
+            __syncwarp();
+
             for (int l = l_start; l <= l_max; l++) {
-                // Reset accumulators
+                // Reset accumulators (partial - Q contribution only)
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     sum_E_re[t] = C(0);
                     sum_E_im[t] = C(0);
@@ -2036,11 +2105,9 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                     sum_B_im[t] = C(0);
                 }
 
-                // Precompute all l-dependent coefficients (outside ring loop)
-                // NOTE: norm = 1/sqrt((l-1)*l*(l+1)*(l+2)) is deferred to output stage
+                // Precompute l-dependent coefficients
                 C norm = compute_spin2_norm<C>(l);
                 C alpha = compute_alpha_lm<C>(l, m);
-                C alpha_prev = (l > 1) ? compute_alpha_lm<C>(l-1, m) : C(0);
                 C m2 = C(m * m);
                 C ll1 = C(l * (l - 1));
                 C two_alpha = C(2) * alpha;
@@ -2048,11 +2115,11 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                 C lm1 = C(l - 1);
                 C two_m2_minus_l = C(2) * (m2 - C(l));
 
-                // Parity for N-S combination (l-dependent)
-                int parity_s0 = (l + m) & 1;  // spin-0 parity (for ₂Y)
-                int parity_m2 = (l + m + 1) & 1;  // ₋₂Y has extra sign flip
+                int parity_s0 = (l + m) & 1;
+                int parity_m2 = (l + m + 1) & 1;
+                C sign_s0 = parity_s0 ? C(-1) : C(1);
+                C sign_m2 = parity_m2 ? C(-1) : C(1);
 
-                // Recurrence coefficients for Ylm (l-dependent)
                 C recur_A = C(0), recur_B = C(0), recur_C = C(0);
                 if (l == m + 1) {
                     recur_C = Traits::sqrt_d(C(2*m + 3));
@@ -2071,7 +2138,7 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                     C sin_th_sq = sin_th * sin_th;
                     C inv_sin_sq = (sin_th_sq > C(1e-20)) ? C(1.0) / sin_th_sq : C(0);
 
-                    // Compute spin-0 Y_{l,m} via recurrence
+                    // Ylm recurrence
                     C Ylm, Ylm_prev;
                     if (l == m) {
                         Ylm = Ylm_prev1[k];
@@ -2088,88 +2155,38 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                         Ylm_prev1[k] = Ylm;
                     }
 
-                    // === Phase 1: Compute ₂Y (unnormalized), accumulate, free ===
-                    // ₂Y_unnorm = (2(m²-l)/sin² - l(l-1)) × Y + 2×alpha×cos/sin² × Y_{l-1}
+                    // Compute ₂Y and ₋₂Y
                     C coeff1 = two_m2_minus_l * inv_sin_sq - ll1;
                     C coeff2 = two_alpha * cos_th * inv_sin_sq;
                     C Y2 = coeff1 * Ylm + coeff2 * Ylm_prev;
 
-                    // Accumulate Y2 contributions for each map
-                    // Y2 uses parity_s0 for both Q (in E) and U (in B)
-                    for (int t = 0; t < n_maps_in_batch; t++) {
-                        R* sh_Gm_t = sh_Gm_base + t * 8 * ring_batch_size;
-
-                        // Get Q Gm (parity_s0) for E equation
-                        C gm_Q_re, gm_Q_im;
-                        if (parity_s0) {
-                            gm_Q_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
-                            gm_Q_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
-                        } else {
-                            gm_Q_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
-                            gm_Q_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
-                        }
-
-                        // Get U Gm (parity_s0) for B equation
-                        C gm_U_re, gm_U_im;
-                        if (parity_s0) {
-                            gm_U_re = C(sh_Gm_t[6 * ring_batch_size + local_r]);
-                            gm_U_im = C(sh_Gm_t[7 * ring_batch_size + local_r]);
-                        } else {
-                            gm_U_re = C(sh_Gm_t[4 * ring_batch_size + local_r]);
-                            gm_U_im = C(sh_Gm_t[5 * ring_batch_size + local_r]);
-                        }
-
-                        // E: ₂Y × Q contribution
-                        sum_E_re[t] += Y2 * gm_Q_re;
-                        sum_E_im[t] += Y2 * gm_Q_im;
-
-                        // B: ₂Y × (i×U) contribution → -U_im, +U_re
-                        sum_B_re[t] -= Y2 * gm_U_im;
-                        sum_B_im[t] += Y2 * gm_U_re;
-                    }
-                    // Y2 no longer needed, register can be reused
-
-                    // === Phase 2: Compute ₋₂Y (unnormalized), accumulate ===
-                    // ₋₂Y_unnorm = 2m/sin² × (alpha × Y_{l-1} - (l-1)×cos × Y)
                     C inner = alpha * Ylm_prev - lm1 * cos_th * Ylm;
                     C Ym2 = two_m * inv_sin_sq * inner;
 
-                    // Accumulate Ym2 contributions for each map
-                    // Ym2 uses parity_m2 for both U (in E) and Q (in B)
+                    // Q contributions (E_re, E_im use Y2; B_re, B_im use Ym2)
                     for (int t = 0; t < n_maps_in_batch; t++) {
-                        R* sh_Gm_t = sh_Gm_base + t * 8 * ring_batch_size;
+                        R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
 
-                        // Get U Gm (parity_m2) for E equation
-                        C gm_U_re, gm_U_im;
-                        if (parity_m2) {
-                            gm_U_re = C(sh_Gm_t[6 * ring_batch_size + local_r]);
-                            gm_U_im = C(sh_Gm_t[7 * ring_batch_size + local_r]);
-                        } else {
-                            gm_U_re = C(sh_Gm_t[4 * ring_batch_size + local_r]);
-                            gm_U_im = C(sh_Gm_t[5 * ring_batch_size + local_r]);
-                        }
+                        C Q_north_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                        C Q_north_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
+                        C Q_south_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
+                        C Q_south_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
 
-                        // Get Q Gm (parity_m2) for B equation
-                        C gm_Q_re, gm_Q_im;
-                        if (parity_m2) {
-                            gm_Q_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
-                            gm_Q_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
-                        } else {
-                            gm_Q_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
-                            gm_Q_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
-                        }
+                        // Q with parity_s0 for ₂Y → E
+                        C gm_Q_s0_re = Q_north_re + sign_s0 * Q_south_re;
+                        C gm_Q_s0_im = Q_north_im + sign_s0 * Q_south_im;
+                        sum_E_re[t] += Y2 * gm_Q_s0_re;
+                        sum_E_im[t] += Y2 * gm_Q_s0_im;
 
-                        // E: ₋₂Y × (i×U) contribution → -U_im, +U_re
-                        sum_E_re[t] -= Ym2 * gm_U_im;
-                        sum_E_im[t] += Ym2 * gm_U_re;
-
-                        // B: ₋₂Y × Q contribution
-                        sum_B_re[t] += Ym2 * gm_Q_re;
-                        sum_B_im[t] += Ym2 * gm_Q_im;
+                        // Q with parity_m2 for ₋₂Y → B
+                        C gm_Q_m2_re = Q_north_re + sign_m2 * Q_south_re;
+                        C gm_Q_m2_im = Q_north_im + sign_m2 * Q_south_im;
+                        sum_B_re[t] += Ym2 * gm_Q_m2_re;
+                        sum_B_im[t] += Ym2 * gm_Q_m2_im;
                     }
                 }
 
-                // Warp-level reduction and output
+                // Warp reduce and write Q partial results
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     C sEr = sum_E_re[t], sEi = sum_E_im[t];
                     C sBr = sum_B_re[t], sBi = sum_B_im[t];
@@ -2189,10 +2206,9 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                         T* B_re_t = alm_B_re + (size_t)global_t * lp1 * lp1;
                         T* B_im_t = alm_B_im + (size_t)global_t * lp1 * lp1;
 
-                        // Apply deferred normalization: norm * pix_area
-                        // This saves one multiply per ring in the inner loop
                         C scale = norm * C(pix_area);
 
+                        // Q pass: write (first batch) or add (subsequent batches)
                         if (batch_start == 0) {
                             E_re_t[l * lp1 + m] = T(sEr * scale);
                             E_im_t[l * lp1 + m] = T(sEi * scale);
@@ -2208,8 +2224,158 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                 }
             }
 
-            // For l < l_start (l=0,1 for spin-2, or l < m), just skip those values
-            // They should remain zero
+            // ================================================================
+            // U PASS: Restore Ylm, load U_north, U_south, compute U contributions
+            // E_re -= U × ₋₂Y (parity_m2) [imaginary part of i×U]
+            // E_im += U × ₋₂Y (parity_m2) [real part of i×U]
+            // B_re -= U × ₂Y (parity_s0) [imaginary part of i×U]
+            // B_im += U × ₂Y (parity_s0) [real part of i×U]
+            // ================================================================
+
+            // Restore Ylm state
+            for (int k = k_start; k < k_end; k++) {
+                Ylm_prev1[k] = Ylm_saved1[k];
+                Ylm_prev2[k] = Ylm_saved2[k];
+            }
+
+            // Load U data (reusing same shared memory)
+            for (int t = 0; t < n_maps_in_batch; t++) {
+                int global_t = map_batch_start + t;
+                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
+                R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
+
+                for (int r = lane; r < batch_size; r += 32) {
+                    size_t idx = base_idx + batch_start + r;
+                    sh_Gm_t[0 * ring_batch_size + r] = Gm_U_north_re[idx];
+                    sh_Gm_t[1 * ring_batch_size + r] = Gm_U_north_im[idx];
+                    sh_Gm_t[2 * ring_batch_size + r] = Gm_U_south_re[idx];
+                    sh_Gm_t[3 * ring_batch_size + r] = Gm_U_south_im[idx];
+                }
+            }
+            __syncwarp();
+
+            for (int l = l_start; l <= l_max; l++) {
+                // Reset accumulators for U contributions
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    sum_E_re[t] = C(0);
+                    sum_E_im[t] = C(0);
+                    sum_B_re[t] = C(0);
+                    sum_B_im[t] = C(0);
+                }
+
+                // Same l-dependent coefficients as Q pass
+                C norm = compute_spin2_norm<C>(l);
+                C alpha = compute_alpha_lm<C>(l, m);
+                C m2 = C(m * m);
+                C ll1 = C(l * (l - 1));
+                C two_alpha = C(2) * alpha;
+                C two_m = C(2) * C(m);
+                C lm1 = C(l - 1);
+                C two_m2_minus_l = C(2) * (m2 - C(l));
+
+                int parity_s0 = (l + m) & 1;
+                int parity_m2 = (l + m + 1) & 1;
+                C sign_s0 = parity_s0 ? C(-1) : C(1);
+                C sign_m2 = parity_m2 ? C(-1) : C(1);
+
+                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                if (l == m + 1) {
+                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                } else if (l > m + 1) {
+                    C l2 = C(l * l);
+                    C lm1_2 = C((l-1) * (l-1));
+                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
+                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                }
+
+                for (int k = k_start; k < k_end; k++) {
+                    int global_r = lane + 32 * k;
+                    int local_r = global_r - batch_start;
+                    C cos_th = C(sh_cos_th[local_r]);
+                    C sin_th = C(sh_sin_th[local_r]);
+                    C sin_th_sq = sin_th * sin_th;
+                    C inv_sin_sq = (sin_th_sq > C(1e-20)) ? C(1.0) / sin_th_sq : C(0);
+
+                    // Ylm recurrence (duplicated from Q pass)
+                    C Ylm, Ylm_prev;
+                    if (l == m) {
+                        Ylm = Ylm_prev1[k];
+                        Ylm_prev = C(0);
+                    } else if (l == m + 1) {
+                        Ylm = cos_th * recur_C * Ylm_prev1[k];
+                        Ylm_prev = Ylm_prev1[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    } else {
+                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
+                        Ylm_prev = Ylm_prev1[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    }
+
+                    // Compute ₂Y and ₋₂Y
+                    C coeff1 = two_m2_minus_l * inv_sin_sq - ll1;
+                    C coeff2 = two_alpha * cos_th * inv_sin_sq;
+                    C Y2 = coeff1 * Ylm + coeff2 * Ylm_prev;
+
+                    C inner = alpha * Ylm_prev - lm1 * cos_th * Ylm;
+                    C Ym2 = two_m * inv_sin_sq * inner;
+
+                    // U contributions via i×U: (i×U)_re = -U_im, (i×U)_im = U_re
+                    for (int t = 0; t < n_maps_in_batch; t++) {
+                        R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
+
+                        C U_north_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                        C U_north_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
+                        C U_south_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
+                        C U_south_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
+
+                        // U with parity_s0 for ₂Y → B (via i×U)
+                        C gm_U_s0_re = U_north_re + sign_s0 * U_south_re;
+                        C gm_U_s0_im = U_north_im + sign_s0 * U_south_im;
+                        // B: ₂Y × (i×U) → B_re -= Y2*U_im, B_im += Y2*U_re
+                        sum_B_re[t] -= Y2 * gm_U_s0_im;
+                        sum_B_im[t] += Y2 * gm_U_s0_re;
+
+                        // U with parity_m2 for ₋₂Y → E (via i×U)
+                        C gm_U_m2_re = U_north_re + sign_m2 * U_south_re;
+                        C gm_U_m2_im = U_north_im + sign_m2 * U_south_im;
+                        // E: ₋₂Y × (i×U) → E_re -= Ym2*U_im, E_im += Ym2*U_re
+                        sum_E_re[t] -= Ym2 * gm_U_m2_im;
+                        sum_E_im[t] += Ym2 * gm_U_m2_re;
+                    }
+                }
+
+                // Warp reduce and ADD U contributions
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    C sEr = sum_E_re[t], sEi = sum_E_im[t];
+                    C sBr = sum_B_re[t], sBi = sum_B_im[t];
+
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2) {
+                        sEr += __shfl_down_sync(0xffffffff, sEr, offset);
+                        sEi += __shfl_down_sync(0xffffffff, sEi, offset);
+                        sBr += __shfl_down_sync(0xffffffff, sBr, offset);
+                        sBi += __shfl_down_sync(0xffffffff, sBi, offset);
+                    }
+
+                    if (lane == 0) {
+                        int global_t = map_batch_start + t;
+                        T* E_re_t = alm_E_re + (size_t)global_t * lp1 * lp1;
+                        T* E_im_t = alm_E_im + (size_t)global_t * lp1 * lp1;
+                        T* B_re_t = alm_B_re + (size_t)global_t * lp1 * lp1;
+                        T* B_im_t = alm_B_im + (size_t)global_t * lp1 * lp1;
+
+                        C scale = norm * C(pix_area);
+
+                        // U pass: always add (Q pass already wrote)
+                        E_re_t[l * lp1 + m] = T(C(E_re_t[l * lp1 + m]) + sEr * scale);
+                        E_im_t[l * lp1 + m] = T(C(E_im_t[l * lp1 + m]) + sEi * scale);
+                        B_re_t[l * lp1 + m] = T(C(B_re_t[l * lp1 + m]) + sBr * scale);
+                        B_im_t[l * lp1 + m] = T(C(B_im_t[l * lp1 + m]) + sBi * scale);
+                    }
+                }
+            }
         }
     }
 }
@@ -2252,18 +2418,18 @@ void map2alm_cuda_v6_spin2_impl(
     size_t gm_size = (size_t)n_maps * lp1 * n_north_rings * sizeof(R);
     size_t geom_size = n_north_rings * sizeof(R);
 
-    R *Gm_Q_even_re, *Gm_Q_even_im, *Gm_Q_odd_re, *Gm_Q_odd_im;
-    R *Gm_U_even_re, *Gm_U_even_im, *Gm_U_odd_re, *Gm_U_odd_im;
+    R *Gm_Q_north_re, *Gm_Q_north_im, *Gm_Q_south_re, *Gm_Q_south_im;
+    R *Gm_U_north_re, *Gm_U_north_im, *Gm_U_south_re, *Gm_U_south_im;
     R *cos_theta, *sin_theta;
 
-    CUDA_CHECK(cudaMalloc(&Gm_Q_even_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_Q_even_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_Q_odd_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_Q_odd_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_U_even_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_U_even_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_U_odd_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_U_odd_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_Q_north_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_Q_north_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_Q_south_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_Q_south_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_U_north_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_U_north_im, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_U_south_re, gm_size));
+    CUDA_CHECK(cudaMalloc(&Gm_U_south_im, gm_size));
     CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
@@ -2283,14 +2449,14 @@ void map2alm_cuda_v6_spin2_impl(
     // Launch both Gm computations in parallel
     compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1, 0, stream_Q>>>(
         nside, l_max, n_maps, n_rings, map_Q,
-        Gm_Q_even_re, Gm_Q_even_im, Gm_Q_odd_re, Gm_Q_odd_im,
+        Gm_Q_north_re, Gm_Q_north_im, Gm_Q_south_re, Gm_Q_south_im,
         cos_theta, sin_theta
     );
     CUDA_CHECK(cudaGetLastError());
 
     compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1, 0, stream_U>>>(
         nside, l_max, n_maps, n_rings, map_U,
-        Gm_U_even_re, Gm_U_even_im, Gm_U_odd_re, Gm_U_odd_im,
+        Gm_U_north_re, Gm_U_north_im, Gm_U_south_re, Gm_U_south_im,
         cos_theta_U, sin_theta_U
     );
     CUDA_CHECK(cudaGetLastError());
@@ -2311,19 +2477,20 @@ void map2alm_cuda_v6_spin2_impl(
     }
 
     // Phase 2: Reduce to E,B alm with spin-2 Ylm
+    // Sequential Q/U loading uses 4 arrays per map at a time (Q_north_re/im, Q_south_re/im)
+    // This is 2x spin-0's 2 arrays, so we need /=2 to fit in shared memory
     int ring_batch_size, n_maps_parallel;
     compute_v6_params<R>(n_maps, &ring_batch_size, &n_maps_parallel);
-    // Reduce parallel maps for spin-2 (more shared memory needed)
-    n_maps_parallel = max(1, n_maps_parallel / 2);
+    n_maps_parallel = max(1, n_maps_parallel / 2);  // 4 arrays vs 2 for spin-0
 
-    size_t smem_size = (2 + 8 * n_maps_parallel) * ring_batch_size * sizeof(R);
+    size_t smem_size = (2 + 4 * n_maps_parallel) * ring_batch_size * sizeof(R);
     R pix_area = R(4.0 * M_PI / (12.0 * nside * nside));
 
     reduce_to_alm_spin2_kernel_v6<T, R><<<lp1, 32, smem_size>>>(
         nside, l_max, n_maps, n_north_rings,
         ring_batch_size, n_maps_parallel,
-        Gm_Q_even_re, Gm_Q_even_im, Gm_Q_odd_re, Gm_Q_odd_im,
-        Gm_U_even_re, Gm_U_even_im, Gm_U_odd_re, Gm_U_odd_im,
+        Gm_Q_north_re, Gm_Q_north_im, Gm_Q_south_re, Gm_Q_south_im,
+        Gm_U_north_re, Gm_U_north_im, Gm_U_south_re, Gm_U_south_im,
         cos_theta, sin_theta, pix_area,
         alm_E_re, alm_E_im, alm_B_re, alm_B_im
     );
@@ -2348,14 +2515,14 @@ void map2alm_cuda_v6_spin2_impl(
     }
 
     // Cleanup
-    cudaFree(Gm_Q_even_re);
-    cudaFree(Gm_Q_even_im);
-    cudaFree(Gm_Q_odd_re);
-    cudaFree(Gm_Q_odd_im);
-    cudaFree(Gm_U_even_re);
-    cudaFree(Gm_U_even_im);
-    cudaFree(Gm_U_odd_re);
-    cudaFree(Gm_U_odd_im);
+    cudaFree(Gm_Q_north_re);
+    cudaFree(Gm_Q_north_im);
+    cudaFree(Gm_Q_south_re);
+    cudaFree(Gm_Q_south_im);
+    cudaFree(Gm_U_north_re);
+    cudaFree(Gm_U_north_im);
+    cudaFree(Gm_U_south_re);
+    cudaFree(Gm_U_south_im);
     cudaFree(cos_theta);
     cudaFree(sin_theta);
 }

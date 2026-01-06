@@ -1095,6 +1095,27 @@ void alm2map_cuda_v6_impl(
         // ============================================================
         size_t smem_p2 = 4 * lp1 * sizeof(R);
         int block_size_p2 = 256;
+
+        // Request extended shared memory if needed
+        const size_t MAX_SMEM = 48 * 1024;
+        if (smem_p2 > MAX_SMEM) {
+            cudaError_t attr_err = cudaFuncSetAttribute(
+                synthesize_map_kernel_v6<T, R>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p2);
+            if (attr_err != cudaSuccess) {
+                fprintf(stderr, "Error: alm2map Phase 2 requires %zu bytes shared memory "
+                        "(l_max=%d), but GPU limit exceeded.\n"
+                        "Try using float32 storage precision for large nside.\n",
+                        smem_p2, l_max);
+                // Clean up
+                cudaFree(alm_scaled_real); cudaFree(alm_scaled_imag);
+                cudaFree(Fmy_even_re); cudaFree(Fmy_even_im);
+                cudaFree(Fmy_odd_re); cudaFree(Fmy_odd_im);
+                cudaFree(cos_theta); cudaFree(sin_theta);
+                return;
+            }
+        }
+
         synthesize_map_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
             nside, l_max, n_maps, n_rings, n_north_rings,
             Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im,
