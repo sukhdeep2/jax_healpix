@@ -32,8 +32,8 @@ enum class Phase1Method {
     BLUESTEIN = 2       // Bluestein FFT for all rings (cuHPX-style)
 };
 
-// Global configuration - can be changed at runtime
-static Phase1Method g_phase1_method = Phase1Method::DFT;
+// Global configuration - can be changed at runtime (used by both map2alm and alm2map)
+Phase1Method g_phase1_method = Phase1Method::DFT;
 
 // ============================================================================
 // cuFFT Plan Cache for Bluestein FFT
@@ -79,16 +79,8 @@ static cufftHandle get_cached_plan(int fft_size, int batch, cufftType type) {
     return plan;
 }
 
-// Helper to get next power of 2
-__host__ __device__ inline int next_power_of_2(int n) {
-    n--;
-    n |= n >> 1;
-    n |= n >> 2;
-    n |= n >> 4;
-    n |= n >> 8;
-    n |= n >> 16;
-    return n + 1;
-}
+// Helper to get next power of 2 (defined in bluestein_fft.h)
+#include "../include/bluestein_fft.h"
 
 // Maximum rings per lane (n_rings / 32)
 // For nside=2048: 4096/32 = 128 rings per lane

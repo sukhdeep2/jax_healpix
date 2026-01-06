@@ -20,8 +20,22 @@
 #include <cuda_bf16.h>
 #include <cufft.h>
 #include "../include/spht_types.h"
+#include "../include/bluestein_fft.h"
 #include <stdio.h>
 #include <type_traits>
+
+// ============================================================================
+// Runtime Phase 1 method selection (defined in map2alm_v6.cu)
+// ============================================================================
+
+enum class Phase1Method {
+    DFT = 0,
+    FFT_EQUATORIAL = 1,
+    BLUESTEIN = 2
+};
+
+// External reference to global flag from map2alm_v6.cu
+extern Phase1Method g_phase1_method;
 
 // Maximum rings per lane (same as map2alm_v6)
 #define MAX_RINGS_PER_LANE 256
@@ -476,6 +490,375 @@ __global__ void scale_alm_spin2_for_synth_kernel(
 }
 
 // ============================================================================
+// Kernel to convert Fmy from even/odd to north/south form
+// Fmy_north = (Fmy_even + Fmy_odd) / 2
+// Fmy_south = (Fmy_even - Fmy_odd) / 2
+// ============================================================================
+
+template<typename R>
+__global__ void convert_fmy_even_odd_to_north_south_kernel(
+    int n_maps, int lp1, int n_north_rings,
+    const R* __restrict__ Fmy_even_re,
+    const R* __restrict__ Fmy_even_im,
+    const R* __restrict__ Fmy_odd_re,
+    const R* __restrict__ Fmy_odd_im,
+    R* __restrict__ Fmy_north_re,
+    R* __restrict__ Fmy_north_im,
+    R* __restrict__ Fmy_south_re,
+    R* __restrict__ Fmy_south_im
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)n_maps * lp1 * n_north_rings;
+
+    if (idx >= total) return;
+
+    R even_re = Fmy_even_re[idx];
+    R even_im = Fmy_even_im[idx];
+    R odd_re = Fmy_odd_re[idx];
+    R odd_im = Fmy_odd_im[idx];
+
+    Fmy_north_re[idx] = R(0.5) * (even_re + odd_re);
+    Fmy_north_im[idx] = R(0.5) * (even_im + odd_im);
+    Fmy_south_re[idx] = R(0.5) * (even_re - odd_re);
+    Fmy_south_im[idx] = R(0.5) * (even_im - odd_im);
+}
+
+// ============================================================================
+// Bluestein inverse pre-chirp kernel for alm2map
+// Handles both north and south hemispheres using separate Fmy arrays
+// ============================================================================
+
+template<typename R>
+__global__ void bluestein_alm2map_pre_chirp_kernel(
+    int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
+    const R* __restrict__ Fmy_north_re,  // [n_maps, lp1, n_north_rings]
+    const R* __restrict__ Fmy_north_im,
+    const R* __restrict__ Fmy_south_re,
+    const R* __restrict__ Fmy_south_im,
+    cufftDoubleComplex* __restrict__ chirped_out,  // [n_maps, n_rings, M]
+    int* __restrict__ ring_sizes_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    // Determine if north or south and get corresponding north_ring index
+    bool is_south = (ring_idx >= n_north_rings);
+    int north_ring = is_south ? (n_rings - 1 - ring_idx) : ring_idx;
+
+    // Compute ring geometry
+    double cos_th, sin_th, phi0;
+    int N;
+    {
+        int ring_i = ring_idx + 1;
+        if (ring_i < nside) {
+            double i2_3n2 = double(ring_i * ring_i) / double(3.0 * nside * nside);
+            cos_th = 1.0 - i2_3n2;
+            sin_th = sqrt(1.0 - cos_th * cos_th);
+            phi0 = M_PI / (2.0 * ring_i) * 0.5;
+            N = 4 * ring_i;
+        } else if (ring_i > 3 * nside) {
+            int mirror_i = 4 * nside - ring_i;
+            double i2_3n2 = double(mirror_i * mirror_i) / double(3.0 * nside * nside);
+            cos_th = -(1.0 - i2_3n2);
+            sin_th = sqrt(1.0 - cos_th * cos_th);
+            phi0 = M_PI / (2.0 * mirror_i) * 0.5;
+            N = 4 * mirror_i;
+        } else {
+            cos_th = 4.0 / 3.0 - 2.0 * ring_i / (3.0 * nside);
+            sin_th = sqrt(1.0 - cos_th * cos_th);
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0 = M_PI / (2.0 * nside) * (1.0 - s / 2.0);
+            N = 4 * nside;
+        }
+    }
+
+    if (map_idx == 0 && threadIdx.x == 0) {
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    // Select appropriate Fmy array
+    const R* fmy_re = is_south ? Fmy_south_re : Fmy_north_re;
+    const R* fmy_im = is_south ? Fmy_south_im : Fmy_north_im;
+
+    cufftDoubleComplex* chirped = chirped_out + (size_t)map_idx * n_rings * M + ring_idx * M;
+    double pi_over_N = M_PI / double(N);
+
+    for (int m = threadIdx.x; m < M; m += blockDim.x) {
+        cufftDoubleComplex val;
+        if (m <= l_max) {
+            size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            double fmy_r = double(fmy_re[idx]);
+            double fmy_i = double(fmy_im[idx]);
+
+            // Phase correction: multiply by exp(+i * m * phi0)
+            double phase_angle = double(m) * phi0;
+            double phase_c, phase_s;
+            sincos(phase_angle, &phase_s, &phase_c);
+            double fmy_r_corr = fmy_r * phase_c - fmy_i * phase_s;
+            double fmy_i_corr = fmy_r * phase_s + fmy_i * phase_c;
+
+            // Pre-chirp for IDFT: multiply by exp(+πi*m²/N)
+            double chirp_angle = pi_over_N * double(m) * double(m);
+            double chirp_c, chirp_s;
+            sincos(chirp_angle, &chirp_s, &chirp_c);
+            val.x = fmy_r_corr * chirp_c - fmy_i_corr * chirp_s;
+            val.y = fmy_r_corr * chirp_s + fmy_i_corr * chirp_c;
+        } else {
+            val.x = 0.0;
+            val.y = 0.0;
+        }
+        chirped[m] = val;
+    }
+}
+
+// Float32 version
+template<typename R>
+__global__ void bluestein_alm2map_pre_chirp_kernel_f32(
+    int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
+    const R* __restrict__ Fmy_north_re,
+    const R* __restrict__ Fmy_north_im,
+    const R* __restrict__ Fmy_south_re,
+    const R* __restrict__ Fmy_south_im,
+    cufftComplex* __restrict__ chirped_out,
+    int* __restrict__ ring_sizes_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    bool is_south = (ring_idx >= n_north_rings);
+    int north_ring = is_south ? (n_rings - 1 - ring_idx) : ring_idx;
+
+    float cos_th, sin_th, phi0;
+    int N;
+    {
+        int ring_i = ring_idx + 1;
+        if (ring_i < nside) {
+            float i2_3n2 = float(ring_i * ring_i) / float(3.0f * nside * nside);
+            cos_th = 1.0f - i2_3n2;
+            sin_th = sqrtf(1.0f - cos_th * cos_th);
+            phi0 = float(M_PI) / float(2.0f * ring_i) * 0.5f;
+            N = 4 * ring_i;
+        } else if (ring_i > 3 * nside) {
+            int mirror_i = 4 * nside - ring_i;
+            float i2_3n2 = float(mirror_i * mirror_i) / float(3.0f * nside * nside);
+            cos_th = -(1.0f - i2_3n2);
+            sin_th = sqrtf(1.0f - cos_th * cos_th);
+            phi0 = float(M_PI) / float(2.0f * mirror_i) * 0.5f;
+            N = 4 * mirror_i;
+        } else {
+            cos_th = 4.0f / 3.0f - 2.0f * ring_i / (3.0f * nside);
+            sin_th = sqrtf(1.0f - cos_th * cos_th);
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0 = float(M_PI) / float(2.0f * nside) * (1.0f - s / 2.0f);
+            N = 4 * nside;
+        }
+    }
+
+    if (map_idx == 0 && threadIdx.x == 0) {
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    const R* fmy_re = is_south ? Fmy_south_re : Fmy_north_re;
+    const R* fmy_im = is_south ? Fmy_south_im : Fmy_north_im;
+
+    cufftComplex* chirped = chirped_out + (size_t)map_idx * n_rings * M + ring_idx * M;
+    float pi_over_N = float(M_PI) / float(N);
+
+    for (int m = threadIdx.x; m < M; m += blockDim.x) {
+        cufftComplex val;
+        if (m <= l_max) {
+            size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            float fmy_r = float(fmy_re[idx]);
+            float fmy_i = float(fmy_im[idx]);
+
+            float phase_angle = float(m) * phi0;
+            float phase_c, phase_s;
+            sincosf(phase_angle, &phase_s, &phase_c);
+            float fmy_r_corr = fmy_r * phase_c - fmy_i * phase_s;
+            float fmy_i_corr = fmy_r * phase_s + fmy_i * phase_c;
+
+            float chirp_angle = pi_over_N * float(m) * float(m);
+            float chirp_c, chirp_s;
+            sincosf(chirp_angle, &chirp_s, &chirp_c);
+            val.x = fmy_r_corr * chirp_c - fmy_i_corr * chirp_s;
+            val.y = fmy_r_corr * chirp_s + fmy_i_corr * chirp_c;
+        } else {
+            val.x = 0.0f;
+            val.y = 0.0f;
+        }
+        chirped[m] = val;
+    }
+}
+
+// Extract map from Bluestein IFFT result
+template<typename T>
+__global__ void bluestein_alm2map_extract_kernel(
+    int nside, int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,
+    const cufftDoubleComplex* __restrict__ ifft_data,
+    T* __restrict__ map_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    double pi_over_N = M_PI / double(N);
+    double inv_M = 1.0 / double(M);
+
+    const cufftDoubleComplex* ifft_ring = ifft_data +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    T* map_ring = map_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        cufftDoubleComplex z = ifft_ring[n];
+        z.x *= inv_M;
+        z.y *= inv_M;
+
+        // Post-chirp for IDFT: multiply by exp(+πi*n²/N)
+        double post_angle = pi_over_N * double(n) * double(n);
+        double post_c, post_s;
+        sincos(post_angle, &post_s, &post_c);
+        double result = z.x * post_c - z.y * post_s;
+
+        map_ring[n] = T(result);
+    }
+}
+
+// Float32 version
+template<typename T>
+__global__ void bluestein_alm2map_extract_kernel_f32(
+    int nside, int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,
+    const cufftComplex* __restrict__ ifft_data,
+    T* __restrict__ map_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    float pi_over_N = float(M_PI) / float(N);
+    float inv_M = 1.0f / float(M);
+
+    const cufftComplex* ifft_ring = ifft_data +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    T* map_ring = map_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        cufftComplex z = ifft_ring[n];
+        z.x *= inv_M;
+        z.y *= inv_M;
+
+        float post_angle = pi_over_N * float(n) * float(n);
+        float post_c, post_s;
+        sincosf(post_angle, &post_s, &post_c);
+        float result = z.x * post_c - z.y * post_s;
+
+        map_ring[n] = T(result);
+    }
+}
+
+// ============================================================================
+// Inverse chirp kernels for IDFT (different sign from forward DFT)
+// For IDFT, the convolution chirp is h[j] = exp(-πi*j²/N) (negative sign)
+// ============================================================================
+
+__global__ void bluestein_compute_inv_chirp_kernel(
+    int nside, int l_max, int M,
+    cufftDoubleComplex* __restrict__ inv_chirp_fft  // [nside, M]
+) {
+    int size_idx = blockIdx.x;  // 0 = size 4, 1 = size 8, ..., nside-1 = size 4*nside
+    int N = 4 * (size_idx + 1);
+
+    if (N > 4 * nside) return;
+
+    cufftDoubleComplex* chirp = inv_chirp_fft + size_idx * M;
+    double pi_over_N = M_PI / double(N);
+
+    // For Bluestein with input length K = l_max + 1 and output length N,
+    // we need chirp values at indices 0..K-1 and M-K+1..M-1 (for negative wrap)
+    // Use K = max(N, l_max + 1) to cover all needed indices
+    int K = (l_max + 1 > N) ? (l_max + 1) : N;
+
+    for (int j = threadIdx.x; j < M; j += blockDim.x) {
+        cufftDoubleComplex val;
+        int j_eff;
+
+        if (j < K) {
+            j_eff = j;
+        } else if (j >= M - K + 1) {
+            j_eff = M - j;  // Wrap-around for negative indices (gives negative j_eff)
+        } else {
+            val.x = 0.0;
+            val.y = 0.0;
+            chirp[j] = val;
+            continue;
+        }
+
+        // NEGATIVE sign for IDFT: exp(-πi*j_eff²/N)
+        // Note: j_eff can be negative for wrap-around indices
+        double angle = pi_over_N * double(j_eff) * double(j_eff);
+        double c, s;
+        sincos(angle, &s, &c);
+        val.x = c;
+        val.y = -s;  // Note: negative sin for exp(-i*angle)
+        chirp[j] = val;
+    }
+}
+
+__global__ void bluestein_compute_inv_chirp_kernel_f32(
+    int nside, int l_max, int M,
+    cufftComplex* __restrict__ inv_chirp_fft
+) {
+    int size_idx = blockIdx.x;
+    int N = 4 * (size_idx + 1);
+
+    if (N > 4 * nside) return;
+
+    cufftComplex* chirp = inv_chirp_fft + size_idx * M;
+    float pi_over_N = float(M_PI) / float(N);
+
+    // For Bluestein with input length K = l_max + 1 and output length N,
+    // we need chirp values at indices 0..K-1 and M-K+1..M-1
+    int K = (l_max + 1 > N) ? (l_max + 1) : N;
+
+    for (int j = threadIdx.x; j < M; j += blockDim.x) {
+        cufftComplex val;
+        int j_eff;
+
+        if (j < K) {
+            j_eff = j;
+        } else if (j >= M - K + 1) {
+            j_eff = M - j;
+        } else {
+            val.x = 0.0f;
+            val.y = 0.0f;
+            chirp[j] = val;
+            continue;
+        }
+
+        float angle = pi_over_N * float(j_eff) * float(j_eff);
+        float c, s;
+        sincosf(angle, &s, &c);
+        val.x = c;
+        val.y = -s;  // Negative sin for IDFT
+        chirp[j] = val;
+    }
+}
+
+// ============================================================================
 // Host wrapper implementation
 // ============================================================================
 
@@ -569,16 +952,157 @@ void alm2map_cuda_v6_impl(
     CUDA_CHECK(cudaMemset(map_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
 
     // Phase 2: Synthesize map from Fmy
-    // Shared memory: 4 Fmy arrays of lp1 elements each
-    size_t smem_p2 = 4 * lp1 * sizeof(R);
+    // Method selected by g_phase1_method (DFT or Bluestein)
 
-    int block_size_p2 = 256;
-    synthesize_map_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
-        nside, l_max, n_maps, n_rings, n_north_rings,
-        Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im,
-        map_out
-    );
-    CUDA_CHECK(cudaGetLastError());
+    if (g_phase1_method == Phase1Method::BLUESTEIN) {
+        // ============================================================
+        // BLUESTEIN INVERSE FFT: Fmy -> map via chirp-z transform
+        // ============================================================
+
+        // First convert Fmy from even/odd to north/south form
+        R *Fmy_north_re, *Fmy_north_im, *Fmy_south_re, *Fmy_south_im;
+        CUDA_CHECK(cudaMalloc(&Fmy_north_re, fmy_size));
+        CUDA_CHECK(cudaMalloc(&Fmy_north_im, fmy_size));
+        CUDA_CHECK(cudaMalloc(&Fmy_south_re, fmy_size));
+        CUDA_CHECK(cudaMalloc(&Fmy_south_im, fmy_size));
+
+        size_t total_elements = (size_t)n_maps * lp1 * n_north_rings;
+        int block_conv = 256;
+        int grid_conv = (total_elements + block_conv - 1) / block_conv;
+        convert_fmy_even_odd_to_north_south_kernel<R><<<grid_conv, block_conv>>>(
+            n_maps, lp1, n_north_rings,
+            Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im,
+            Fmy_north_re, Fmy_north_im, Fmy_south_re, Fmy_south_im
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        // Compute M = next power of 2 >= l_max + 1 + max_ring_size - 1
+        // This is required because Bluestein convolution needs M >= input_length + output_length - 1
+        // where input_length = l_max + 1 (number of m values) and output_length = ring_size
+        int max_ring_size = 4 * nside;
+        int M = next_power_of_2(lp1 + max_ring_size - 1);
+
+        // Allocate Bluestein buffers
+        int* ring_sizes;
+        CUDA_CHECK(cudaMalloc(&ring_sizes, n_rings * sizeof(int)));
+
+        bool use_double = std::is_same<R, double>::value;
+
+        if (use_double) {
+            // Double precision Bluestein inverse
+            cufftDoubleComplex* chirped_data;
+            cufftDoubleComplex* conj_chirp_fft;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftDoubleComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftDoubleComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+
+            // Compute conjugate chirp for all unique ring sizes
+            bluestein_compute_inv_chirp_kernel<<<nside, 256>>>(nside, l_max, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            // FFT the conjugate chirps
+            cufftHandle chirp_fft_plan = get_cached_fft_plan(M, nside, CUFFT_Z2Z);
+            cufftExecZ2Z(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+
+            // Pre-chirp for all rings (north and south)
+            dim3 grid_all(n_rings, n_maps);
+            bluestein_alm2map_pre_chirp_kernel<R><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, n_north_rings, l_max, M,
+                Fmy_north_re, Fmy_north_im, Fmy_south_re, Fmy_south_im,
+                chirped_data, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // FFT all chirped data
+            cufftHandle data_fft_plan = get_cached_fft_plan(M, n_maps * n_rings, CUFFT_Z2Z);
+            cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
+
+            // Pointwise multiply with conjugate chirp
+            bluestein_pointwise_mult_kernel_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_data, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // IFFT
+            cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
+
+            // Extract map pixels with post-chirp
+            bluestein_alm2map_extract_kernel<T><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, M,
+                ring_sizes, chirped_data, map_out
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(chirped_data);
+            cudaFree(conj_chirp_fft);
+        } else {
+            // Float32 precision Bluestein inverse
+            cufftComplex* chirped_data;
+            cufftComplex* conj_chirp_fft;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+
+            bluestein_compute_inv_chirp_kernel_f32<<<nside, 256>>>(nside, l_max, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle chirp_fft_plan = get_cached_fft_plan(M, nside, CUFFT_C2C);
+            cufftExecC2C(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+
+            dim3 grid_all(n_rings, n_maps);
+            bluestein_alm2map_pre_chirp_kernel_f32<R><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, n_north_rings, l_max, M,
+                Fmy_north_re, Fmy_north_im, Fmy_south_re, Fmy_south_im,
+                chirped_data, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle data_fft_plan = get_cached_fft_plan(M, n_maps * n_rings, CUFFT_C2C);
+            cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
+
+            bluestein_pointwise_mult_kernel_f32_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_data, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
+
+            bluestein_alm2map_extract_kernel_f32<T><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, M,
+                ring_sizes, chirped_data, map_out
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(chirped_data);
+            cudaFree(conj_chirp_fft);
+        }
+
+        cudaFree(ring_sizes);
+        cudaFree(Fmy_north_re);
+        cudaFree(Fmy_north_im);
+        cudaFree(Fmy_south_re);
+        cudaFree(Fmy_south_im);
+
+    } else {
+        // ============================================================
+        // DIRECT DFT: Default method
+        // ============================================================
+        size_t smem_p2 = 4 * lp1 * sizeof(R);
+        int block_size_p2 = 256;
+        synthesize_map_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
+            nside, l_max, n_maps, n_rings, n_north_rings,
+            Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im,
+            map_out
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (timing_enabled) {
@@ -1115,6 +1639,279 @@ __global__ void synthesize_map_spin2_kernel_v6(
 }
 
 // ============================================================================
+// Spin-2 Bluestein kernels for alm2map
+// These handle Q and U components together, using north/south Fmy directly
+// ============================================================================
+
+template<typename R>
+__global__ void bluestein_spin2_pre_chirp_kernel(
+    int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
+    const R* __restrict__ Fmy_Q_north_re,  // [n_maps, lp1, n_north_rings]
+    const R* __restrict__ Fmy_Q_north_im,
+    const R* __restrict__ Fmy_Q_south_re,
+    const R* __restrict__ Fmy_Q_south_im,
+    const R* __restrict__ Fmy_U_north_re,
+    const R* __restrict__ Fmy_U_north_im,
+    const R* __restrict__ Fmy_U_south_re,
+    const R* __restrict__ Fmy_U_south_im,
+    cufftDoubleComplex* __restrict__ chirped_Q,  // [n_maps, n_rings, M]
+    cufftDoubleComplex* __restrict__ chirped_U,
+    int* __restrict__ ring_sizes_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    bool is_south = (ring_idx >= n_north_rings);
+    int north_ring = is_south ? (n_rings - 1 - ring_idx) : ring_idx;
+
+    // Compute ring geometry
+    double phi0;
+    int N;
+    {
+        int ring_i = ring_idx + 1;
+        if (ring_i < nside) {
+            phi0 = M_PI / (2.0 * ring_i) * 0.5;
+            N = 4 * ring_i;
+        } else if (ring_i > 3 * nside) {
+            int mirror_i = 4 * nside - ring_i;
+            phi0 = M_PI / (2.0 * mirror_i) * 0.5;
+            N = 4 * mirror_i;
+        } else {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0 = M_PI / (2.0 * nside) * (1.0 - s / 2.0);
+            N = 4 * nside;
+        }
+    }
+
+    if (map_idx == 0 && threadIdx.x == 0) {
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    const R* fmy_Q_re = is_south ? Fmy_Q_south_re : Fmy_Q_north_re;
+    const R* fmy_Q_im = is_south ? Fmy_Q_south_im : Fmy_Q_north_im;
+    const R* fmy_U_re = is_south ? Fmy_U_south_re : Fmy_U_north_re;
+    const R* fmy_U_im = is_south ? Fmy_U_south_im : Fmy_U_north_im;
+
+    cufftDoubleComplex* chirped_Q_ring = chirped_Q + (size_t)map_idx * n_rings * M + ring_idx * M;
+    cufftDoubleComplex* chirped_U_ring = chirped_U + (size_t)map_idx * n_rings * M + ring_idx * M;
+    double pi_over_N = M_PI / double(N);
+
+    for (int m = threadIdx.x; m < M; m += blockDim.x) {
+        cufftDoubleComplex val_Q, val_U;
+        if (m <= l_max) {
+            size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            double fQ_r = double(fmy_Q_re[idx]);
+            double fQ_i = double(fmy_Q_im[idx]);
+            double fU_r = double(fmy_U_re[idx]);
+            double fU_i = double(fmy_U_im[idx]);
+
+            double phase_angle = double(m) * phi0;
+            double phase_c, phase_s;
+            sincos(phase_angle, &phase_s, &phase_c);
+            double fQ_r_corr = fQ_r * phase_c - fQ_i * phase_s;
+            double fQ_i_corr = fQ_r * phase_s + fQ_i * phase_c;
+            double fU_r_corr = fU_r * phase_c - fU_i * phase_s;
+            double fU_i_corr = fU_r * phase_s + fU_i * phase_c;
+
+            double chirp_angle = pi_over_N * double(m) * double(m);
+            double chirp_c, chirp_s;
+            sincos(chirp_angle, &chirp_s, &chirp_c);
+
+            val_Q.x = fQ_r_corr * chirp_c - fQ_i_corr * chirp_s;
+            val_Q.y = fQ_r_corr * chirp_s + fQ_i_corr * chirp_c;
+            val_U.x = fU_r_corr * chirp_c - fU_i_corr * chirp_s;
+            val_U.y = fU_r_corr * chirp_s + fU_i_corr * chirp_c;
+        } else {
+            val_Q.x = val_Q.y = val_U.x = val_U.y = 0.0;
+        }
+        chirped_Q_ring[m] = val_Q;
+        chirped_U_ring[m] = val_U;
+    }
+}
+
+// Float32 version
+template<typename R>
+__global__ void bluestein_spin2_pre_chirp_kernel_f32(
+    int nside, int n_maps, int n_rings, int n_north_rings, int l_max, int M,
+    const R* __restrict__ Fmy_Q_north_re,
+    const R* __restrict__ Fmy_Q_north_im,
+    const R* __restrict__ Fmy_Q_south_re,
+    const R* __restrict__ Fmy_Q_south_im,
+    const R* __restrict__ Fmy_U_north_re,
+    const R* __restrict__ Fmy_U_north_im,
+    const R* __restrict__ Fmy_U_south_re,
+    const R* __restrict__ Fmy_U_south_im,
+    cufftComplex* __restrict__ chirped_Q,
+    cufftComplex* __restrict__ chirped_U,
+    int* __restrict__ ring_sizes_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    bool is_south = (ring_idx >= n_north_rings);
+    int north_ring = is_south ? (n_rings - 1 - ring_idx) : ring_idx;
+
+    float phi0;
+    int N;
+    {
+        int ring_i = ring_idx + 1;
+        if (ring_i < nside) {
+            phi0 = float(M_PI) / float(2.0f * ring_i) * 0.5f;
+            N = 4 * ring_i;
+        } else if (ring_i > 3 * nside) {
+            int mirror_i = 4 * nside - ring_i;
+            phi0 = float(M_PI) / float(2.0f * mirror_i) * 0.5f;
+            N = 4 * mirror_i;
+        } else {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0 = float(M_PI) / float(2.0f * nside) * (1.0f - s / 2.0f);
+            N = 4 * nside;
+        }
+    }
+
+    if (map_idx == 0 && threadIdx.x == 0) {
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    const R* fmy_Q_re = is_south ? Fmy_Q_south_re : Fmy_Q_north_re;
+    const R* fmy_Q_im = is_south ? Fmy_Q_south_im : Fmy_Q_north_im;
+    const R* fmy_U_re = is_south ? Fmy_U_south_re : Fmy_U_north_re;
+    const R* fmy_U_im = is_south ? Fmy_U_south_im : Fmy_U_north_im;
+
+    cufftComplex* chirped_Q_ring = chirped_Q + (size_t)map_idx * n_rings * M + ring_idx * M;
+    cufftComplex* chirped_U_ring = chirped_U + (size_t)map_idx * n_rings * M + ring_idx * M;
+    float pi_over_N = float(M_PI) / float(N);
+
+    for (int m = threadIdx.x; m < M; m += blockDim.x) {
+        cufftComplex val_Q, val_U;
+        if (m <= l_max) {
+            size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            float fQ_r = float(fmy_Q_re[idx]);
+            float fQ_i = float(fmy_Q_im[idx]);
+            float fU_r = float(fmy_U_re[idx]);
+            float fU_i = float(fmy_U_im[idx]);
+
+            float phase_angle = float(m) * phi0;
+            float phase_c, phase_s;
+            sincosf(phase_angle, &phase_s, &phase_c);
+            float fQ_r_corr = fQ_r * phase_c - fQ_i * phase_s;
+            float fQ_i_corr = fQ_r * phase_s + fQ_i * phase_c;
+            float fU_r_corr = fU_r * phase_c - fU_i * phase_s;
+            float fU_i_corr = fU_r * phase_s + fU_i * phase_c;
+
+            float chirp_angle = pi_over_N * float(m) * float(m);
+            float chirp_c, chirp_s;
+            sincosf(chirp_angle, &chirp_s, &chirp_c);
+
+            val_Q.x = fQ_r_corr * chirp_c - fQ_i_corr * chirp_s;
+            val_Q.y = fQ_r_corr * chirp_s + fQ_i_corr * chirp_c;
+            val_U.x = fU_r_corr * chirp_c - fU_i_corr * chirp_s;
+            val_U.y = fU_r_corr * chirp_s + fU_i_corr * chirp_c;
+        } else {
+            val_Q.x = val_Q.y = val_U.x = val_U.y = 0.0f;
+        }
+        chirped_Q_ring[m] = val_Q;
+        chirped_U_ring[m] = val_U;
+    }
+}
+
+// Spin-2 extract kernel
+template<typename T>
+__global__ void bluestein_spin2_extract_kernel(
+    int nside, int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,
+    const cufftDoubleComplex* __restrict__ ifft_Q,
+    const cufftDoubleComplex* __restrict__ ifft_U,
+    T* __restrict__ map_Q_out,
+    T* __restrict__ map_U_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    double pi_over_N = M_PI / double(N);
+    double inv_M = 1.0 / double(M);
+
+    const cufftDoubleComplex* ifft_Q_ring = ifft_Q +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    const cufftDoubleComplex* ifft_U_ring = ifft_U +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    T* map_Q_ring = map_Q_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+    T* map_U_ring = map_U_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        cufftDoubleComplex zQ = ifft_Q_ring[n];
+        cufftDoubleComplex zU = ifft_U_ring[n];
+        zQ.x *= inv_M; zQ.y *= inv_M;
+        zU.x *= inv_M; zU.y *= inv_M;
+
+        double post_angle = pi_over_N * double(n) * double(n);
+        double post_c, post_s;
+        sincos(post_angle, &post_s, &post_c);
+
+        double result_Q = zQ.x * post_c - zQ.y * post_s;
+        double result_U = zU.x * post_c - zU.y * post_s;
+
+        map_Q_ring[n] = T(result_Q);
+        map_U_ring[n] = T(result_U);
+    }
+}
+
+// Float32 version
+template<typename T>
+__global__ void bluestein_spin2_extract_kernel_f32(
+    int nside, int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,
+    const cufftComplex* __restrict__ ifft_Q,
+    const cufftComplex* __restrict__ ifft_U,
+    T* __restrict__ map_Q_out,
+    T* __restrict__ map_U_out
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    float pi_over_N = float(M_PI) / float(N);
+    float inv_M = 1.0f / float(M);
+
+    const cufftComplex* ifft_Q_ring = ifft_Q +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    const cufftComplex* ifft_U_ring = ifft_U +
+        (size_t)map_idx * n_rings * M + ring_idx * M;
+    T* map_Q_ring = map_Q_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+    T* map_U_ring = map_U_out + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        cufftComplex zQ = ifft_Q_ring[n];
+        cufftComplex zU = ifft_U_ring[n];
+        zQ.x *= inv_M; zQ.y *= inv_M;
+        zU.x *= inv_M; zU.y *= inv_M;
+
+        float post_angle = pi_over_N * float(n) * float(n);
+        float post_c, post_s;
+        sincosf(post_angle, &post_s, &post_c);
+
+        float result_Q = zQ.x * post_c - zQ.y * post_s;
+        float result_U = zU.x * post_c - zU.y * post_s;
+
+        map_Q_ring[n] = T(result_Q);
+        map_U_ring[n] = T(result_U);
+    }
+}
+
+// ============================================================================
 // Spin-2 host wrapper
 // ============================================================================
 
@@ -1243,39 +2040,175 @@ void alm2map_cuda_v6_spin2_impl(
     CUDA_CHECK(cudaMemset(map_U_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
 
     // Phase 2: Synthesize maps
-    // Uses 4 shared memory arrays (Q/U × re/im) - processes north/south separately
-    size_t smem_p2 = 4 * lp1 * sizeof(R);
-    int block_size_p2 = 256;
+    // Method selected by g_phase1_method (DFT or Bluestein)
 
-    // Request extended shared memory if needed
-    if (smem_p2 > MAX_SMEM) {
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            synthesize_map_spin2_kernel_v6<T, R>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p2);
-        if (attr_err != cudaSuccess) {
-            fprintf(stderr, "Error: Spin-2 alm2map Phase 2 requires %zu bytes shared memory "
-                    "(l_max=%d), but GPU limit exceeded.\n"
-                    "Try using float32 storage precision for large nside.\n",
-                    smem_p2, l_max);
-            // Clean up
-            cudaFree(alm_E_scaled_re); cudaFree(alm_E_scaled_im);
-            cudaFree(alm_B_scaled_re); cudaFree(alm_B_scaled_im);
-            cudaFree(Fmy_Q_north_re); cudaFree(Fmy_Q_north_im);
-            cudaFree(Fmy_Q_south_re); cudaFree(Fmy_Q_south_im);
-            cudaFree(Fmy_U_north_re); cudaFree(Fmy_U_north_im);
-            cudaFree(Fmy_U_south_re); cudaFree(Fmy_U_south_im);
-            cudaFree(cos_theta); cudaFree(sin_theta);
-            return;
+    if (g_phase1_method == Phase1Method::BLUESTEIN) {
+        // ============================================================
+        // BLUESTEIN INVERSE FFT for Spin-2: Fmy -> Q,U maps
+        // ============================================================
+
+        // Compute M = next power of 2 >= l_max + 1 + max_ring_size - 1
+        // This is required because Bluestein convolution needs M >= input_length + output_length - 1
+        // where input_length = l_max + 1 (number of m values) and output_length = ring_size
+        int max_ring_size = 4 * nside;
+        int M = next_power_of_2(lp1 + max_ring_size - 1);
+
+        int* ring_sizes;
+        CUDA_CHECK(cudaMalloc(&ring_sizes, n_rings * sizeof(int)));
+
+        bool use_double = std::is_same<R, double>::value;
+
+        if (use_double) {
+            cufftDoubleComplex* chirped_Q;
+            cufftDoubleComplex* chirped_U;
+            cufftDoubleComplex* conj_chirp_fft;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftDoubleComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftDoubleComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_Q, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&chirped_U, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+
+            // Compute conjugate chirp
+            bluestein_compute_inv_chirp_kernel<<<nside, 256>>>(nside, l_max, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle chirp_fft_plan = get_cached_fft_plan(M, nside, CUFFT_Z2Z);
+            cufftExecZ2Z(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+
+            // Pre-chirp for Q and U
+            dim3 grid_all(n_rings, n_maps);
+            bluestein_spin2_pre_chirp_kernel<R><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, n_north_rings, l_max, M,
+                Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
+                Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
+                chirped_Q, chirped_U, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // FFT both Q and U
+            cufftHandle data_fft_plan = get_cached_fft_plan(M, n_maps * n_rings, CUFFT_Z2Z);
+            cufftExecZ2Z(data_fft_plan, chirped_Q, chirped_Q, CUFFT_FORWARD);
+            cufftExecZ2Z(data_fft_plan, chirped_U, chirped_U, CUFFT_FORWARD);
+
+            // Pointwise multiply
+            bluestein_pointwise_mult_kernel_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_Q, conj_chirp_fft
+            );
+            bluestein_pointwise_mult_kernel_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_U, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // IFFT both
+            cufftExecZ2Z(data_fft_plan, chirped_Q, chirped_Q, CUFFT_INVERSE);
+            cufftExecZ2Z(data_fft_plan, chirped_U, chirped_U, CUFFT_INVERSE);
+
+            // Extract Q and U maps
+            bluestein_spin2_extract_kernel<T><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, M,
+                ring_sizes, chirped_Q, chirped_U, map_Q_out, map_U_out
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(chirped_Q);
+            cudaFree(chirped_U);
+            cudaFree(conj_chirp_fft);
+        } else {
+            // Float32 precision
+            cufftComplex* chirped_Q;
+            cufftComplex* chirped_U;
+            cufftComplex* conj_chirp_fft;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_Q, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&chirped_U, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+
+            bluestein_compute_inv_chirp_kernel_f32<<<nside, 256>>>(nside, l_max, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle chirp_fft_plan = get_cached_fft_plan(M, nside, CUFFT_C2C);
+            cufftExecC2C(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+
+            dim3 grid_all(n_rings, n_maps);
+            bluestein_spin2_pre_chirp_kernel_f32<R><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, n_north_rings, l_max, M,
+                Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
+                Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
+                chirped_Q, chirped_U, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle data_fft_plan = get_cached_fft_plan(M, n_maps * n_rings, CUFFT_C2C);
+            cufftExecC2C(data_fft_plan, chirped_Q, chirped_Q, CUFFT_FORWARD);
+            cufftExecC2C(data_fft_plan, chirped_U, chirped_U, CUFFT_FORWARD);
+
+            bluestein_pointwise_mult_kernel_f32_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_Q, conj_chirp_fft
+            );
+            bluestein_pointwise_mult_kernel_f32_v2<<<grid_all, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_U, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftExecC2C(data_fft_plan, chirped_Q, chirped_Q, CUFFT_INVERSE);
+            cufftExecC2C(data_fft_plan, chirped_U, chirped_U, CUFFT_INVERSE);
+
+            bluestein_spin2_extract_kernel_f32<T><<<grid_all, 256>>>(
+                nside, n_maps, n_rings, M,
+                ring_sizes, chirped_Q, chirped_U, map_Q_out, map_U_out
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(chirped_Q);
+            cudaFree(chirped_U);
+            cudaFree(conj_chirp_fft);
         }
+
+        cudaFree(ring_sizes);
+
+    } else {
+        // ============================================================
+        // DIRECT DFT: Default method
+        // ============================================================
+        size_t smem_p2 = 4 * lp1 * sizeof(R);
+        int block_size_p2 = 256;
+
+        // Request extended shared memory if needed
+        if (smem_p2 > MAX_SMEM) {
+            cudaError_t attr_err = cudaFuncSetAttribute(
+                synthesize_map_spin2_kernel_v6<T, R>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p2);
+            if (attr_err != cudaSuccess) {
+                fprintf(stderr, "Error: Spin-2 alm2map Phase 2 requires %zu bytes shared memory "
+                        "(l_max=%d), but GPU limit exceeded.\n"
+                        "Try using float32 storage precision for large nside.\n",
+                        smem_p2, l_max);
+                // Clean up
+                cudaFree(alm_E_scaled_re); cudaFree(alm_E_scaled_im);
+                cudaFree(alm_B_scaled_re); cudaFree(alm_B_scaled_im);
+                cudaFree(Fmy_Q_north_re); cudaFree(Fmy_Q_north_im);
+                cudaFree(Fmy_Q_south_re); cudaFree(Fmy_Q_south_im);
+                cudaFree(Fmy_U_north_re); cudaFree(Fmy_U_north_im);
+                cudaFree(Fmy_U_south_re); cudaFree(Fmy_U_south_im);
+                cudaFree(cos_theta); cudaFree(sin_theta);
+                return;
+            }
+        }
+
+        synthesize_map_spin2_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
+            nside, l_max, n_maps, n_rings, n_north_rings,
+            Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
+            Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
+            map_Q_out, map_U_out
+        );
+        CUDA_CHECK(cudaGetLastError());
     }
 
-    synthesize_map_spin2_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
-        nside, l_max, n_maps, n_rings, n_north_rings,
-        Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
-        Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
-        map_Q_out, map_U_out
-    );
-    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (timing_enabled) {

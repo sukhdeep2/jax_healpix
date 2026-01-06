@@ -71,6 +71,7 @@ SOURCES=(
     "alm2map_v6.cu"    # Optimal warp-per-m synthesis (matching map2alm_v6)
     "alm2cl.cu"        # Power spectrum computation
     "fft_gm.cu"        # FFT-based Gm
+    "bluestein_fft.cu" # Bluestein FFT for arbitrary-size DFT/IDFT
     "spht_api.cu"
 )
 
