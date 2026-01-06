@@ -57,9 +57,14 @@ struct V6TraitsSynth<double> {
     using compute_t = double;
     using complex_storage_t = double2;
     static constexpr double PI_VAL = 3.14159265358979323846;
+    static constexpr double LOG_PI_VAL = 1.1447298858494002;  // log(π)
+    static constexpr double LOG_2_VAL = 0.6931471805599453;   // log(2)
+    static constexpr double LOG_3_VAL = 1.0986122886681098;   // log(3)
+    static constexpr double LOG_4_VAL = 1.3862943611198906;   // log(4)
 
     static __device__ __forceinline__ double sqrt_d(double x) { return sqrt(x); }
     static __device__ __forceinline__ double exp_d(double x) { return exp(x); }
+    static __device__ __forceinline__ double log_d(double x) { return log(x); }
     static __device__ __forceinline__ void sincos_d(double x, double* s, double* c) { sincos(x, s, c); }
     static __device__ __forceinline__ double load(const double* p) { return __ldg(p); }
 };
@@ -70,9 +75,14 @@ struct V6TraitsSynth<float> {
     using compute_t = float;
     using complex_storage_t = float2;
     static constexpr float PI_VAL = 3.14159265f;
+    static constexpr float LOG_PI_VAL = 1.14472988f;  // logf(π)
+    static constexpr float LOG_2_VAL = 0.69314718f;   // logf(2)
+    static constexpr float LOG_3_VAL = 1.09861228f;   // logf(3)
+    static constexpr float LOG_4_VAL = 1.38629436f;   // logf(4)
 
     static __device__ __forceinline__ float sqrt_d(float x) { return sqrtf(x); }
     static __device__ __forceinline__ float exp_d(float x) { return expf(x); }
+    static __device__ __forceinline__ float log_d(float x) { return logf(x); }
     static __device__ __forceinline__ void sincos_d(float x, float* s, float* c) { sincosf(x, s, c); }
     static __device__ __forceinline__ float load(const float* p) { return __ldg(p); }
 };
@@ -93,27 +103,38 @@ __device__ __forceinline__ void compute_ring_geom_synth_v6(
     C cos_th, sin_th, phi0;
     int npix;
 
+    // Precompute log(nside) for log arithmetic
+    C log_nside = Traits::log_d(C(nside));
+
     if (ring_i < nside) {
         // North polar cap
-        C i2_3n2 = C(ring_i * ring_i) / C(3.0 * nside * nside);
+        // i2_3n2 = ring_i² / (3 * nside²) using log arithmetic
+        C log_ring_i = Traits::log_d(C(ring_i));
+        C i2_3n2 = Traits::exp_d(C(2.0) * log_ring_i - Traits::LOG_3_VAL - C(2.0) * log_nside);
         cos_th = C(1.0) - i2_3n2;
         sin_th = Traits::sqrt_d(C(1.0) - cos_th * cos_th);
-        phi0 = C(Traits::PI_VAL) / C(2.0 * ring_i) * C(0.5);
+        // phi0 = PI / (4 * ring_i) using log arithmetic
+        phi0 = Traits::exp_d(Traits::LOG_PI_VAL - Traits::LOG_4_VAL - log_ring_i);
         npix = 4 * ring_i;
     } else if (ring_i > 3 * nside) {
         // South polar cap
         int mirror_i = 4 * nside - ring_i;
-        C i2_3n2 = C(mirror_i * mirror_i) / C(3.0 * nside * nside);
+        C log_mirror_i = Traits::log_d(C(mirror_i));
+        C i2_3n2 = Traits::exp_d(C(2.0) * log_mirror_i - Traits::LOG_3_VAL - C(2.0) * log_nside);
         cos_th = -(C(1.0) - i2_3n2);
         sin_th = Traits::sqrt_d(C(1.0) - cos_th * cos_th);
-        phi0 = C(Traits::PI_VAL) / C(2.0 * mirror_i) * C(0.5);
+        phi0 = Traits::exp_d(Traits::LOG_PI_VAL - Traits::LOG_4_VAL - log_mirror_i);
         npix = 4 * mirror_i;
     } else {
         // Equatorial belt
-        cos_th = C(4.0 / 3.0) - C(2.0 * ring_i) / C(3.0 * nside);
+        // cos_th = 4/3 - 2*ring_i/(3*nside), use log for the division part
+        C log_ring_i = Traits::log_d(C(ring_i));
+        C term = Traits::exp_d(Traits::LOG_2_VAL + log_ring_i - Traits::LOG_3_VAL - log_nside);
+        cos_th = C(4.0 / 3.0) - term;
         sin_th = Traits::sqrt_d(C(1.0) - cos_th * cos_th);
         int s = (ring_i % 2 == 0) ? 1 : 2;
-        phi0 = C(Traits::PI_VAL) / C(2.0 * nside) * C(1.0 - s / 2.0);
+        // phi0 = PI / (2 * nside) * (1 - s/2)
+        phi0 = Traits::exp_d(Traits::LOG_PI_VAL - Traits::LOG_2_VAL - log_nside) * C(1.0 - s / 2.0);
         npix = 4 * nside;
     }
 
@@ -390,8 +411,11 @@ __global__ void synthesize_map_kernel_v6(
                 C fmy_n_im = C(sh_fmy_even_im[m] + sh_fmy_odd_im[m]) * C(0.5);
 
                 // Phase: exp(+i*m*phi_j) where phi_j = phi_0 + j*2*pi/n_pix
-                C phi_j = C(phi0_n) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
-                C angle = C(m) * phi_j;
+                // Use modular arithmetic to avoid precision loss when m is large
+                // angle = m*phi0 + m*j*2π/N = m*phi0 + (m*j mod N)*2π/N + k*2π
+                // The k*2π term doesn't affect sin/cos, so we use (m*j mod N)
+                int mj_mod_N = (m * j) % n_pix_n;
+                C angle = C(m) * C(phi0_n) + C(mj_mod_N) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
                 C cos_ang, sin_ang;
                 Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
@@ -415,8 +439,9 @@ __global__ void synthesize_map_kernel_v6(
                     C fmy_s_re = C(sh_fmy_even_re[m] - sh_fmy_odd_re[m]) * C(0.5);
                     C fmy_s_im = C(sh_fmy_even_im[m] - sh_fmy_odd_im[m]) * C(0.5);
 
-                    C phi_j = C(phi0_s) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
-                    C angle = C(m) * phi_j;
+                    // Use modular arithmetic to avoid precision loss when m is large
+                    int mj_mod_N = (m * j) % n_pix_s;
+                    C angle = C(m) * C(phi0_s) + C(mj_mod_N) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
                     C cos_ang, sin_ang;
                     Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
@@ -638,25 +663,35 @@ __global__ void bluestein_alm2map_pre_chirp_kernel_f32(
     float cos_th, sin_th, phi0;
     int N;
     {
+        constexpr float LOG_PI = 1.14472988f;
+        constexpr float LOG_2 = 0.69314718f;
+        constexpr float LOG_3 = 1.09861228f;
+        constexpr float LOG_4 = 1.38629436f;
+        float log_nside = logf(float(nside));
+
         int ring_i = ring_idx + 1;
         if (ring_i < nside) {
-            float i2_3n2 = float(ring_i * ring_i) / float(3.0f * nside * nside);
+            float log_ring_i = logf(float(ring_i));
+            float i2_3n2 = expf(2.0f * log_ring_i - LOG_3 - 2.0f * log_nside);
             cos_th = 1.0f - i2_3n2;
             sin_th = sqrtf(1.0f - cos_th * cos_th);
-            phi0 = float(M_PI) / float(2.0f * ring_i) * 0.5f;
+            phi0 = expf(LOG_PI - LOG_4 - log_ring_i);
             N = 4 * ring_i;
         } else if (ring_i > 3 * nside) {
             int mirror_i = 4 * nside - ring_i;
-            float i2_3n2 = float(mirror_i * mirror_i) / float(3.0f * nside * nside);
+            float log_mirror_i = logf(float(mirror_i));
+            float i2_3n2 = expf(2.0f * log_mirror_i - LOG_3 - 2.0f * log_nside);
             cos_th = -(1.0f - i2_3n2);
             sin_th = sqrtf(1.0f - cos_th * cos_th);
-            phi0 = float(M_PI) / float(2.0f * mirror_i) * 0.5f;
+            phi0 = expf(LOG_PI - LOG_4 - log_mirror_i);
             N = 4 * mirror_i;
         } else {
-            cos_th = 4.0f / 3.0f - 2.0f * ring_i / (3.0f * nside);
+            float log_ring_i = logf(float(ring_i));
+            float term = expf(LOG_2 + log_ring_i - LOG_3 - log_nside);
+            cos_th = 4.0f / 3.0f - term;
             sin_th = sqrtf(1.0f - cos_th * cos_th);
             int s = (ring_i % 2 == 0) ? 1 : 2;
-            phi0 = float(M_PI) / float(2.0f * nside) * (1.0f - s / 2.0f);
+            phi0 = expf(LOG_PI - LOG_2 - log_nside) * (1.0f - s / 2.0f);
             N = 4 * nside;
         }
     }
@@ -669,7 +704,8 @@ __global__ void bluestein_alm2map_pre_chirp_kernel_f32(
     const R* fmy_im = is_south ? Fmy_south_im : Fmy_north_im;
 
     cufftComplex* chirped = chirped_out + (size_t)map_idx * n_rings * M + ring_idx * M;
-    float pi_over_N = float(M_PI) / float(N);
+    constexpr float LOG_PI = 1.14472988f;  // logf(π)
+    float log_N = logf(float(N));
 
     for (int m = threadIdx.x; m < M; m += blockDim.x) {
         cufftComplex val;
@@ -678,13 +714,15 @@ __global__ void bluestein_alm2map_pre_chirp_kernel_f32(
             float fmy_r = float(fmy_re[idx]);
             float fmy_i = float(fmy_im[idx]);
 
+            // phase_angle = m * phi0
             float phase_angle = float(m) * phi0;
             float phase_c, phase_s;
             sincosf(phase_angle, &phase_s, &phase_c);
             float fmy_r_corr = fmy_r * phase_c - fmy_i * phase_s;
             float fmy_i_corr = fmy_r * phase_s + fmy_i * phase_c;
 
-            float chirp_angle = pi_over_N * float(m) * float(m);
+            // Use log arithmetic: chirp_angle = π*m²/N = exp(log(π) + 2*log(m) - log(N))
+            float chirp_angle = (m == 0) ? 0.0f : expf(LOG_PI + 2.0f * logf(float(m)) - log_N);
             float chirp_c, chirp_s;
             sincosf(chirp_angle, &chirp_s, &chirp_c);
             val.x = fmy_r_corr * chirp_c - fmy_i_corr * chirp_s;
@@ -749,7 +787,8 @@ __global__ void bluestein_alm2map_extract_kernel_f32(
     if (ring_idx >= n_rings || map_idx >= n_maps) return;
 
     int N = ring_sizes[ring_idx];
-    float pi_over_N = float(M_PI) / float(N);
+    constexpr float LOG_PI = 1.14472988f;  // logf(π)
+    float log_N = logf(float(N));
     float inv_M = 1.0f / float(M);
 
     const cufftComplex* ifft_ring = ifft_data +
@@ -761,7 +800,8 @@ __global__ void bluestein_alm2map_extract_kernel_f32(
         z.x *= inv_M;
         z.y *= inv_M;
 
-        float post_angle = pi_over_N * float(n) * float(n);
+        // Use log arithmetic: post_angle = π * n² / N = exp(log(π) + 2*log(n) - log(N))
+        float post_angle = (n == 0) ? 0.0f : expf(LOG_PI + 2.0f * logf(float(n)) - log_N);
         float post_c, post_s;
         sincosf(post_angle, &post_s, &post_c);
         float result = z.x * post_c - z.y * post_s;
@@ -785,7 +825,7 @@ __global__ void bluestein_compute_inv_chirp_kernel(
     if (N > 4 * nside) return;
 
     cufftDoubleComplex* chirp = inv_chirp_fft + size_idx * M;
-    double pi_over_N = M_PI / double(N);
+    
 
     // For Bluestein with input length K = l_max + 1 and output length N,
     // we need chirp values at indices 0..K-1 and M-K+1..M-1 (for negative wrap)
@@ -809,6 +849,7 @@ __global__ void bluestein_compute_inv_chirp_kernel(
 
         // NEGATIVE sign for IDFT: exp(-πi*j_eff²/N)
         // Note: j_eff can be negative for wrap-around indices
+        double pi_over_N = M_PI / double(N);
         double angle = pi_over_N * double(j_eff) * double(j_eff);
         double c, s;
         sincos(angle, &s, &c);
@@ -828,7 +869,8 @@ __global__ void bluestein_compute_inv_chirp_kernel_f32(
     if (N > 4 * nside) return;
 
     cufftComplex* chirp = inv_chirp_fft + size_idx * M;
-    float pi_over_N = float(M_PI) / float(N);
+    constexpr float LOG_PI = 1.14472988f;  // logf(π)
+    float log_N = logf(float(N));
 
     // For Bluestein with input length K = l_max + 1 and output length N,
     // we need chirp values at indices 0..K-1 and M-K+1..M-1
@@ -849,7 +891,8 @@ __global__ void bluestein_compute_inv_chirp_kernel_f32(
             continue;
         }
 
-        float angle = pi_over_N * float(j_eff) * float(j_eff);
+        // Use log arithmetic: angle = π * j_eff² / N = exp(log(π) + 2*log(j_eff) - log(N))
+        float angle = (j_eff == 0) ? 0.0f : expf(LOG_PI + 2.0f * logf(float(j_eff)) - log_N);
         float c, s;
         sincosf(angle, &s, &c);
         val.x = c;
@@ -1593,15 +1636,15 @@ __global__ void synthesize_map_spin2_kernel_v6(
             C sum_Q_re = C(0), sum_Q_im = C(0);
             C sum_U_re = C(0), sum_U_im = C(0);
 
-            C phi_j = C(phi0_n) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
-
             for (int m = 0; m <= l_max; m++) {
                 C fmy_Q_re = C(sh_fmy_Q_re[m]);
                 C fmy_Q_im = C(sh_fmy_Q_im[m]);
                 C fmy_U_re = C(sh_fmy_U_re[m]);
                 C fmy_U_im = C(sh_fmy_U_im[m]);
 
-                C angle = C(m) * phi_j;
+                // Use modular arithmetic to avoid precision loss when m is large
+                int mj_mod_N = (m * j) % n_pix_n;
+                C angle = C(m) * C(phi0_n) + C(mj_mod_N) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
                 C cos_ang, sin_ang;
                 Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
@@ -1633,15 +1676,15 @@ __global__ void synthesize_map_spin2_kernel_v6(
                 C sum_Q_re = C(0), sum_Q_im = C(0);
                 C sum_U_re = C(0), sum_U_im = C(0);
 
-                C phi_j = C(phi0_s) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
-
                 for (int m = 0; m <= l_max; m++) {
                     C fmy_Q_re = C(sh_fmy_Q_re[m]);
                     C fmy_Q_im = C(sh_fmy_Q_im[m]);
                     C fmy_U_re = C(sh_fmy_U_re[m]);
                     C fmy_U_im = C(sh_fmy_U_im[m]);
 
-                    C angle = C(m) * phi_j;
+                    // Use modular arithmetic to avoid precision loss when m is large
+                    int mj_mod_N = (m * j) % n_pix_s;
+                    C angle = C(m) * C(phi0_s) + C(mj_mod_N) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
                     C cos_ang, sin_ang;
                     Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
@@ -1781,17 +1824,22 @@ __global__ void bluestein_spin2_pre_chirp_kernel_f32(
     float phi0;
     int N;
     {
+        constexpr float LOG_PI = 1.14472988f;
+        constexpr float LOG_2 = 0.69314718f;
+        constexpr float LOG_4 = 1.38629436f;
+        float log_nside = logf(float(nside));
+
         int ring_i = ring_idx + 1;
         if (ring_i < nside) {
-            phi0 = float(M_PI) / float(2.0f * ring_i) * 0.5f;
+            phi0 = expf(LOG_PI - LOG_4 - logf(float(ring_i)));
             N = 4 * ring_i;
         } else if (ring_i > 3 * nside) {
             int mirror_i = 4 * nside - ring_i;
-            phi0 = float(M_PI) / float(2.0f * mirror_i) * 0.5f;
+            phi0 = expf(LOG_PI - LOG_4 - logf(float(mirror_i)));
             N = 4 * mirror_i;
         } else {
             int s = (ring_i % 2 == 0) ? 1 : 2;
-            phi0 = float(M_PI) / float(2.0f * nside) * (1.0f - s / 2.0f);
+            phi0 = expf(LOG_PI - LOG_2 - log_nside) * (1.0f - s / 2.0f);
             N = 4 * nside;
         }
     }
@@ -1807,7 +1855,8 @@ __global__ void bluestein_spin2_pre_chirp_kernel_f32(
 
     cufftComplex* chirped_Q_ring = chirped_Q + (size_t)map_idx * n_rings * M + ring_idx * M;
     cufftComplex* chirped_U_ring = chirped_U + (size_t)map_idx * n_rings * M + ring_idx * M;
-    float pi_over_N = float(M_PI) / float(N);
+    constexpr float LOG_PI = 1.14472988f;  // logf(π)
+    float log_N = logf(float(N));
 
     for (int m = threadIdx.x; m < M; m += blockDim.x) {
         cufftComplex val_Q, val_U;
@@ -1818,6 +1867,7 @@ __global__ void bluestein_spin2_pre_chirp_kernel_f32(
             float fU_r = float(fmy_U_re[idx]);
             float fU_i = float(fmy_U_im[idx]);
 
+            // phase_angle = m * phi0
             float phase_angle = float(m) * phi0;
             float phase_c, phase_s;
             sincosf(phase_angle, &phase_s, &phase_c);
@@ -1826,7 +1876,8 @@ __global__ void bluestein_spin2_pre_chirp_kernel_f32(
             float fU_r_corr = fU_r * phase_c - fU_i * phase_s;
             float fU_i_corr = fU_r * phase_s + fU_i * phase_c;
 
-            float chirp_angle = pi_over_N * float(m) * float(m);
+            // Use log arithmetic: chirp_angle = π*m²/N = exp(log(π) + 2*log(m) - log(N))
+            float chirp_angle = (m == 0) ? 0.0f : expf(LOG_PI + 2.0f * logf(float(m)) - log_N);
             float chirp_c, chirp_s;
             sincosf(chirp_angle, &chirp_s, &chirp_c);
 
@@ -1904,7 +1955,8 @@ __global__ void bluestein_spin2_extract_kernel_f32(
     if (ring_idx >= n_rings || map_idx >= n_maps) return;
 
     int N = ring_sizes[ring_idx];
-    float pi_over_N = float(M_PI) / float(N);
+    constexpr float LOG_PI = 1.14472988f;  // logf(π)
+    float log_N = logf(float(N));
     float inv_M = 1.0f / float(M);
 
     const cufftComplex* ifft_Q_ring = ifft_Q +
@@ -1920,7 +1972,8 @@ __global__ void bluestein_spin2_extract_kernel_f32(
         zQ.x *= inv_M; zQ.y *= inv_M;
         zU.x *= inv_M; zU.y *= inv_M;
 
-        float post_angle = pi_over_N * float(n) * float(n);
+        // Use log arithmetic: post_angle = π * n² / N = exp(log(π) + 2*log(n) - log(N))
+        float post_angle = (n == 0) ? 0.0f : expf(LOG_PI + 2.0f * logf(float(n)) - log_N);
         float post_c, post_s;
         sincosf(post_angle, &post_s, &post_c);
 
