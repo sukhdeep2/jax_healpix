@@ -228,13 +228,17 @@ __global__ void compute_gm_kernel_v6(
 }
 
 // ============================================================================
-// Phase 2: Reduce to alm using warp-per-m with cached Gm
-// One warp per m value, processes all rings cooperatively
+// Phase 2: Reduce to alm using warp-per-m with ring batching
+// One warp per m value, processes rings in batches to fit shared memory
 // ============================================================================
+
+// Ring batch size for v6 - 6 arrays * 256 * 8 bytes = 12KB, well under 48KB limit
+#undef RING_BATCH_SIZE
+#define RING_BATCH_SIZE 256
 
 template<typename T, typename R>
 __global__ void reduce_to_alm_kernel_v6(
-    int l_max, int n_maps, int n_north_rings,
+    int nside, int l_max, int n_maps, int n_north_rings,
     const R* __restrict__ Gm_even_re,
     const R* __restrict__ Gm_even_im,
     const R* __restrict__ Gm_odd_re,
@@ -255,112 +259,130 @@ __global__ void reduce_to_alm_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
-    // Shared memory for caching Gm and geometry
+    // Shared memory for current batch (6 arrays of RING_BATCH_SIZE)
     extern __shared__ char smem[];
     R* sh_Gm_even_re = (R*)smem;
-    R* sh_Gm_even_im = sh_Gm_even_re + n_north_rings;
-    R* sh_Gm_odd_re  = sh_Gm_even_im + n_north_rings;
-    R* sh_Gm_odd_im  = sh_Gm_odd_re + n_north_rings;
-    R* sh_cos_th     = sh_Gm_odd_im + n_north_rings;
-    R* sh_sin_th     = sh_cos_th + n_north_rings;
+    R* sh_Gm_even_im = sh_Gm_even_re + RING_BATCH_SIZE;
+    R* sh_Gm_odd_re  = sh_Gm_even_im + RING_BATCH_SIZE;
+    R* sh_Gm_odd_im  = sh_Gm_odd_re + RING_BATCH_SIZE;
+    R* sh_cos_th     = sh_Gm_odd_im + RING_BATCH_SIZE;
+    R* sh_sin_th     = sh_cos_th + RING_BATCH_SIZE;
 
     // Per-lane Ylm recurrence state (local memory, L1 cached)
-    int n_my_rings = (n_north_rings + 31 - lane) / 32;
     C Ylm_prev1[MAX_RINGS_PER_LANE];
     C Ylm_prev2[MAX_RINGS_PER_LANE];
 
     // Process each map
     for (int t = 0; t < n_maps; t++) {
-        // Cooperative load of Gm and geometry into shared memory
         size_t base_idx = (size_t)t * n_north_rings * lp1;
-        for (int r = lane; r < n_north_rings; r += 32) {
-            size_t idx = base_idx + r * lp1 + m;
-            sh_Gm_even_re[r] = Gm_even_re[idx];
-            sh_Gm_even_im[r] = Gm_even_im[idx];
-            sh_Gm_odd_re[r]  = Gm_odd_re[idx];
-            sh_Gm_odd_im[r]  = Gm_odd_im[idx];
-            if (t == 0) {  // Only load geometry once
-                sh_cos_th[r] = cos_theta[r];
-                sh_sin_th[r] = sin_theta[r];
-            }
-        }
-        __syncwarp();  // Only warp-level sync needed!
-
-        // Initialize Y[m,m] for all my rings using direct multiplication (matches v5)
-        int idx = 0;
-        for (int r = lane; r < n_north_rings; r += 32, idx++) {
-            C sin_th = C(sh_sin_th[r]);
-
-            // Y[m,m] = (-1)^m * sin^m(θ) * sqrt((2m+1)!!/(2m)!!) / sqrt(4π)
-            // Use direct multiplication like v5 for numerical stability
-            C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
-            for (int k = 1; k <= m; k++) {
-                Ymm *= -sin_th * Traits::sqrt_d(C(2*k + 1) / C(2*k));
-            }
-
-            Ylm_prev1[idx] = Ymm;
-            Ylm_prev2[idx] = C(0);
-        }
 
         // Output pointer for this map
         T* alm_re_t = alm_out_re + (size_t)t * lp1 * lp1;
         T* alm_im_t = alm_out_im + (size_t)t * lp1 * lp1;
 
-        // Process l = m to l_max
-        for (int l = m; l <= l_max; l++) {
-            C sum_re = C(0), sum_im = C(0);
+        // Process ring batches
+        for (int batch_start = 0; batch_start < n_north_rings; batch_start += RING_BATCH_SIZE) {
+            int batch_end = min(batch_start + RING_BATCH_SIZE, n_north_rings);
+            int batch_size = batch_end - batch_start;
 
-            idx = 0;
-            for (int r = lane; r < n_north_rings; r += 32, idx++) {
-                C cos_th = C(sh_cos_th[r]);
-                C Ylm;
+            // Cooperative load of Gm and geometry for this batch
+            for (int r = lane; r < batch_size; r += 32) {
+                int global_r = batch_start + r;
+                size_t idx = base_idx + global_r * lp1 + m;
+                sh_Gm_even_re[r] = Gm_even_re[idx];
+                sh_Gm_even_im[r] = Gm_even_im[idx];
+                sh_Gm_odd_re[r]  = Gm_odd_re[idx];
+                sh_Gm_odd_im[r]  = Gm_odd_im[idx];
+                sh_cos_th[r] = cos_theta[global_r];
+                sh_sin_th[r] = sin_theta[global_r];
+            }
+            __syncwarp();
 
-                if (l == m) {
-                    Ylm = Ylm_prev1[idx];
-                } else if (l == m + 1) {
-                    // Y[m+1,m] = cos(θ) * sqrt(2m+3) * Y[m,m]
-                    Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_prev1[idx];
-                    Ylm_prev2[idx] = Ylm_prev1[idx];
-                    Ylm_prev1[idx] = Ylm;
-                } else {
-                    // Recurrence: Y[l,m] = A*cos(θ)*Y[l-1,m] - B*Y[l-2,m]
-                    C l2 = C(l * l);
-                    C m2 = C(m * m);
-                    C lm1_2 = C((l-1) * (l-1));
+            // Determine which rings this lane handles in this batch
+            // Lane handles global rings: lane, lane+32, lane+64, ...
+            // Find first k such that lane + 32*k >= batch_start
+            int k_start = (batch_start > lane) ? (batch_start - lane + 31) / 32 : 0;
+            // Find last k such that lane + 32*k < batch_end
+            int k_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
+            int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
+            k_end = min(k_end, n_my_rings_total);
 
-                    C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                    C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+            // Initialize Y[m,m] for rings in this batch (only on first l iteration)
+            for (int k = k_start; k < k_end; k++) {
+                int global_r = lane + 32 * k;
+                int local_r = global_r - batch_start;
+                C sin_th = C(sh_sin_th[local_r]);
 
-                    Ylm = A * cos_th * Ylm_prev1[idx] - B * Ylm_prev2[idx];
-                    Ylm_prev2[idx] = Ylm_prev1[idx];
-                    Ylm_prev1[idx] = Ylm;
+                // Y[m,m] = (-1)^m * sin^m(θ) * sqrt((2m+1)!!/(2m)!!) / sqrt(4π)
+                C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
+                for (int j = 1; j <= m; j++) {
+                    Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
                 }
 
-                // Select Gm based on (l+m) parity
-                C gm_re, gm_im;
-                if ((l + m) & 1) {
-                    gm_re = C(sh_Gm_odd_re[r]);
-                    gm_im = C(sh_Gm_odd_im[r]);
-                } else {
-                    gm_re = C(sh_Gm_even_re[r]);
-                    gm_im = C(sh_Gm_even_im[r]);
+                Ylm_prev1[k] = Ymm;
+                Ylm_prev2[k] = C(0);
+            }
+
+            // Process l = m to l_max for this batch
+            for (int l = m; l <= l_max; l++) {
+                C sum_re = C(0), sum_im = C(0);
+
+                for (int k = k_start; k < k_end; k++) {
+                    int global_r = lane + 32 * k;
+                    int local_r = global_r - batch_start;
+                    C cos_th = C(sh_cos_th[local_r]);
+                    C Ylm;
+
+                    if (l == m) {
+                        Ylm = Ylm_prev1[k];
+                    } else if (l == m + 1) {
+                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_prev1[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    } else {
+                        C l2 = C(l * l);
+                        C m2 = C(m * m);
+                        C lm1_2 = C((l-1) * (l-1));
+
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+
+                        Ylm = A * cos_th * Ylm_prev1[k] - B * Ylm_prev2[k];
+                        Ylm_prev2[k] = Ylm_prev1[k];
+                        Ylm_prev1[k] = Ylm;
+                    }
+
+                    // Select Gm based on (l+m) parity
+                    C gm_re, gm_im;
+                    if ((l + m) & 1) {
+                        gm_re = C(sh_Gm_odd_re[local_r]);
+                        gm_im = C(sh_Gm_odd_im[local_r]);
+                    } else {
+                        gm_re = C(sh_Gm_even_re[local_r]);
+                        gm_im = C(sh_Gm_even_im[local_r]);
+                    }
+
+                    sum_re += Ylm * gm_re;
+                    sum_im += Ylm * gm_im;
                 }
 
-                sum_re += Ylm * gm_re;
-                sum_im += Ylm * gm_im;
-            }
+                // Warp-level reduction
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    sum_re += __shfl_down_sync(0xffffffff, sum_re, offset);
+                    sum_im += __shfl_down_sync(0xffffffff, sum_im, offset);
+                }
 
-            // Warp-level reduction (NO __syncthreads!)
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                sum_re += __shfl_down_sync(0xffffffff, sum_re, offset);
-                sum_im += __shfl_down_sync(0xffffffff, sum_im, offset);
-            }
-
-            // Lane 0 writes final result
-            if (lane == 0) {
-                alm_re_t[l * lp1 + m] = T(sum_re * C(pix_area));
-                alm_im_t[l * lp1 + m] = T(sum_im * C(pix_area));
+                // Lane 0 accumulates (first batch writes, subsequent batches add)
+                if (lane == 0) {
+                    if (batch_start == 0) {
+                        alm_re_t[l * lp1 + m] = T(sum_re * C(pix_area));
+                        alm_im_t[l * lp1 + m] = T(sum_im * C(pix_area));
+                    } else {
+                        alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sum_re * C(pix_area));
+                        alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + sum_im * C(pix_area));
+                    }
+                }
             }
         }
     }
@@ -402,7 +424,7 @@ void map2alm_cuda_v6_impl(
     CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
-    // Phase 1: Compute Gm
+    // Phase 1: Compute Gm and geometry
     int block_size_p1 = min(256, lp1);
     compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
         nside, l_max, n_maps, n_rings, map_in,
@@ -411,28 +433,15 @@ void map2alm_cuda_v6_impl(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Phase 2: Reduce to alm
-    // Shared memory: 6 arrays of n_north_rings elements
-    size_t smem_size = 6 * n_north_rings * sizeof(R);
-
-    // Check shared memory limit
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-
-    if (smem_size > prop.sharedMemPerBlock) {
-        fprintf(stderr, "Warning: Required shared memory %zu exceeds limit %zu\n",
-                smem_size, prop.sharedMemPerBlock);
-        fprintf(stderr, "Consider using smaller nside or a different approach\n");
-        // Could fall back to v5 here, but for now just warn
-    }
+    // Phase 2: Reduce to alm with ring batching
+    // Shared memory: 6 arrays of RING_BATCH_SIZE elements
+    size_t smem_size = 6 * RING_BATCH_SIZE * sizeof(R);
 
     R pix_area = R(4.0 * M_PI / (12.0 * nside * nside));
 
     // One block per m, 32 threads (one warp)
     reduce_to_alm_kernel_v6<T, R><<<lp1, 32, smem_size>>>(
-        l_max, n_maps, n_north_rings,
+        nside, l_max, n_maps, n_north_rings,
         Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
         cos_theta, sin_theta, pix_area,
         alm_out_re, alm_out_im

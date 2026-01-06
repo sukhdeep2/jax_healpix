@@ -124,7 +124,7 @@ def run_benchmark(nside, n_iterations):
     # CUDA benchmarks with different precision configurations
     cuda_configs = [
         # v5 configurations
-        ('v5_f64_f64', 'float64', 'float64', 'v5'),  # Full float64
+        # ('v5_f64_f64', 'float64', 'float64', 'v5'),  # Full float64
         ('v5_f32_f64', 'float32', 'float64', 'v5'),  # f32 storage, f64 recurrence
         ('v5_f32_f32', 'float32', 'float32', 'v5'),  # Full float32
         # v6 configurations
