@@ -257,6 +257,12 @@ def _setup_functions(lib):
     lib.spht_get_ring_geometry.argtypes = [c_int, c_void_p, c_void_p]
     lib.spht_get_ring_geometry.restype = None
 
+    # v6 Phase 1 method configuration
+    lib.map2alm_v6_set_phase1_method.argtypes = [c_int]
+    lib.map2alm_v6_set_phase1_method.restype = None
+    lib.map2alm_v6_get_phase1_method.argtypes = []
+    lib.map2alm_v6_get_phase1_method.restype = c_int
+
 
 def get_ring_geometry(nside: int):
     """
@@ -282,6 +288,59 @@ def get_ring_geometry(nside: int):
     )
 
     return log_beta, beta_sign
+
+
+# ============================================================================
+# Phase 1 Method Configuration for v6
+# ============================================================================
+
+# Method constants
+PHASE1_DFT = 0            # Direct DFT for all rings (default, simple)
+PHASE1_FFT_EQUATORIAL = 1  # FFT for equatorial rings, DFT for polar
+PHASE1_BLUESTEIN = 2       # Bluestein FFT for all rings (cuHPX-style)
+
+
+def set_phase1_method(method: int):
+    """
+    Set the Phase 1 (Gm computation) method for v6 map2alm.
+
+    Args:
+        method: One of:
+            - PHASE1_DFT (0): Direct DFT for all rings (default, simple, good for small nside)
+            - PHASE1_FFT_EQUATORIAL (1): FFT for equatorial rings, DFT for polar
+            - PHASE1_BLUESTEIN (2): Bluestein FFT for all rings (cuHPX-style)
+
+    Examples:
+        # Use DFT (default)
+        set_phase1_method(PHASE1_DFT)
+
+        # Use Bluestein FFT (cuHPX-style)
+        set_phase1_method(PHASE1_BLUESTEIN)
+    """
+    lib = _get_lib()
+    lib.map2alm_v6_set_phase1_method(method)
+
+
+def get_phase1_method() -> int:
+    """
+    Get the current Phase 1 method for v6 map2alm.
+
+    Returns:
+        Current method: PHASE1_DFT, PHASE1_FFT_EQUATORIAL, or PHASE1_BLUESTEIN
+    """
+    lib = _get_lib()
+    return lib.map2alm_v6_get_phase1_method()
+
+
+def get_phase1_method_name() -> str:
+    """Get the name of the current Phase 1 method."""
+    method = get_phase1_method()
+    names = {
+        PHASE1_DFT: "DFT",
+        PHASE1_FFT_EQUATORIAL: "FFT_EQUATORIAL",
+        PHASE1_BLUESTEIN: "BLUESTEIN"
+    }
+    return names.get(method, f"UNKNOWN({method})")
 
 
 def compute_ylm_cuda(l_max: int, log_beta: np.ndarray) -> np.ndarray:

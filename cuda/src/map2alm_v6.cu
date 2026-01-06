@@ -17,9 +17,34 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cufft.h>
 #include "../include/spht_types.h"
 #include <stdio.h>
 #include <type_traits>
+
+// ============================================================================
+// Runtime configuration for Phase 1 method
+// ============================================================================
+
+enum class Phase1Method {
+    DFT = 0,           // Direct DFT for all rings (default, simple, good for small nside)
+    FFT_EQUATORIAL = 1, // FFT for equatorial rings, DFT for polar (hybrid)
+    BLUESTEIN = 2       // Bluestein FFT for all rings (cuHPX-style)
+};
+
+// Global configuration - can be changed at runtime
+static Phase1Method g_phase1_method = Phase1Method::DFT;
+
+// Helper to get next power of 2
+__host__ __device__ inline int next_power_of_2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    return n + 1;
+}
 
 // Maximum rings per lane (n_rings / 32)
 // For nside=2048: 4096/32 = 128 rings per lane
@@ -225,6 +250,788 @@ __global__ void compute_gm_kernel_v6(
             Gm_odd_re[idx]  = R(gn_re - gs_re);
             Gm_odd_im[idx]  = R(gn_im - gs_im);
         }
+    }
+}
+
+// ============================================================================
+// Hybrid FFT/DFT: Polar DFT kernel (for rings 0 to nside-2)
+// These rings have varying sizes (4, 8, ..., 4*(nside-1))
+// DFT is acceptable here since rings are small
+// ============================================================================
+
+template<typename T, typename R>
+__global__ void compute_gm_polar_dft_kernel(
+    int nside, int l_max, int n_maps, int n_rings,
+    const T* __restrict__ map_in,
+    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_even_im,
+    R* __restrict__ Gm_odd_re,
+    R* __restrict__ Gm_odd_im,
+    R* __restrict__ cos_theta_out,  // [n_north_rings]
+    R* __restrict__ sin_theta_out
+) {
+    using Traits = V6Traits<T>;
+    using C = typename Traits::compute_t;
+
+    // Only process polar rings: north_ring 0 to nside-2
+    int north_ring = blockIdx.x;
+    int n_polar_rings = nside - 1;
+    int n_north_rings = 2 * nside;
+    int lp1 = l_max + 1;
+    int max_pix = 4 * nside;
+
+    if (north_ring >= n_polar_rings) return;
+
+    int south_ring = n_rings - 1 - north_ring;
+
+    // Compute geometry for north polar ring
+    T cos_th_n, sin_th_n, phi0_n;
+    int n_pix_n;
+    compute_ring_geom_v6<T>(north_ring, nside, &cos_th_n, &sin_th_n, &phi0_n, &n_pix_n);
+
+    // South polar ring geometry
+    T cos_th_s, sin_th_s, phi0_s;
+    int n_pix_s;
+    compute_ring_geom_v6<T>(south_ring, nside, &cos_th_s, &sin_th_s, &phi0_s, &n_pix_s);
+
+    // Store geometry (thread 0 only)
+    if (threadIdx.x == 0) {
+        cos_theta_out[north_ring] = R(cos_th_n);
+        sin_theta_out[north_ring] = R(sin_th_n);
+    }
+
+    // Process each map
+    for (int t = 0; t < n_maps; t++) {
+        const T* map_t = map_in + (size_t)t * n_rings * max_pix;
+
+        // Each thread handles one or more m values
+        for (int m = threadIdx.x; m <= l_max; m += blockDim.x) {
+            C gn_re = C(0), gn_im = C(0);
+            C gs_re = C(0), gs_im = C(0);
+
+            // North ring DFT
+            C dphi_n = C(2.0 * Traits::PI_VAL) / C(n_pix_n);
+            int m_eff_n = m % n_pix_n;
+
+            for (int j = 0; j < n_pix_n; j++) {
+                C val = C(Traits::load(&map_t[north_ring * max_pix + j]));
+                C angle = -C(m) * C(phi0_n) - C(m_eff_n) * C(j) * dphi_n;
+                C c, s;
+                Traits::sincos_d(angle, &s, &c);
+                gn_re += val * c;
+                gn_im += val * s;
+            }
+
+            // South ring DFT
+            C dphi_s = C(2.0 * Traits::PI_VAL) / C(n_pix_s);
+            int m_eff_s = m % n_pix_s;
+
+            for (int j = 0; j < n_pix_s; j++) {
+                C val = C(Traits::load(&map_t[south_ring * max_pix + j]));
+                C angle = -C(m) * C(phi0_s) - C(m_eff_s) * C(j) * dphi_s;
+                C c, s;
+                Traits::sincos_d(angle, &s, &c);
+                gs_re += val * c;
+                gs_im += val * s;
+            }
+
+            // Combine with N-S symmetry
+            // Layout: [n_maps, lp1, n_north_rings]
+            size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            Gm_even_re[idx] = R(gn_re + gs_re);
+            Gm_even_im[idx] = R(gn_im + gs_im);
+            Gm_odd_re[idx]  = R(gn_re - gs_re);
+            Gm_odd_im[idx]  = R(gn_im - gs_im);
+        }
+    }
+}
+
+// ============================================================================
+// Hybrid FFT/DFT: Equatorial FFT phase correction and combination kernel
+// Applies exp(-i*m*phi_0) phase correction and combines N/S pairs
+// ============================================================================
+
+// Double precision FFT version of phase correction kernel
+// FFT output and phi_0 are double, Gm output is R
+template<typename R>
+__global__ void equatorial_phase_combine_kernel(
+    int nside, int l_max, int n_maps,
+    int fft_size,      // 4*nside
+    int fft_out_size,  // 2*nside+1
+    int n_equatorial,  // 2*nside+1 rings
+    const cufftDoubleComplex* __restrict__ fft_out,  // [n_maps, n_equatorial, fft_out_size]
+    const double* __restrict__ phi_0,    // [n_equatorial] - double for f64 FFT
+    R* __restrict__ Gm_even_re,     // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_even_im,
+    R* __restrict__ Gm_odd_re,
+    R* __restrict__ Gm_odd_im,
+    R* __restrict__ cos_theta_out,  // [n_north_rings]
+    R* __restrict__ sin_theta_out
+) {
+    // Grid: blockIdx.x = m value, blockIdx.y = map index
+    // Process equatorial north_rings (nside-1 to 2*nside-1, that's nside+1 rings)
+    int m = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int n_north_rings = 2 * nside;
+    int lp1 = l_max + 1;
+    int n_eq_north = nside + 1;  // Number of equatorial north_ring values
+
+    if (m > l_max || map_idx >= n_maps) return;
+
+    // Process each equatorial north_ring (one per thread block iteration)
+    for (int k = threadIdx.x; k < n_eq_north; k += blockDim.x) {
+        int north_ring = nside - 1 + k;  // north_ring index (nside-1 to 2*nside-1)
+        bool is_equator = (k == nside);  // k=nside means north_ring=2*nside-1 (equator)
+
+        // FFT buffer indices for north and south equatorial rings
+        // Equatorial rings span ring indices nside-1 to 3*nside-1
+        // FFT buffer index = ring_index - (nside-1)
+        int fft_idx_north = k;                    // 0 to nside
+        int fft_idx_south = 2 * nside - k;        // 2*nside down to nside
+
+        // Get FFT output with periodicity and conjugate symmetry
+        int m_mod = m % fft_size;
+        cufftDoubleComplex fft_val_n, fft_val_s;
+
+        size_t fft_base_n = (size_t)map_idx * n_equatorial * fft_out_size + fft_idx_north * fft_out_size;
+        size_t fft_base_s = (size_t)map_idx * n_equatorial * fft_out_size + fft_idx_south * fft_out_size;
+
+        if (m_mod < fft_out_size) {
+            fft_val_n = fft_out[fft_base_n + m_mod];
+            fft_val_s = fft_out[fft_base_s + m_mod];
+        } else {
+            // Use conjugate symmetry: FFT[m_mod] = conj(FFT[N-m_mod])
+            int mirror_m = fft_size - m_mod;
+            fft_val_n = fft_out[fft_base_n + mirror_m];
+            fft_val_n.y = -fft_val_n.y;
+            fft_val_s = fft_out[fft_base_s + mirror_m];
+            fft_val_s.y = -fft_val_s.y;
+        }
+
+        // Phase correction: multiply by exp(-i * m * phi_0)
+        double phi_0_n = (double)phi_0[fft_idx_north];
+        double phi_0_s = (double)phi_0[fft_idx_south];
+
+        double angle_n = -m * phi_0_n;
+        double angle_s = -m * phi_0_s;
+        double cos_n, sin_n, cos_s, sin_s;
+        sincos(angle_n, &sin_n, &cos_n);
+        sincos(angle_s, &sin_s, &cos_s);
+
+        // Apply phase correction
+        double gn_re = fft_val_n.x * cos_n - fft_val_n.y * sin_n;
+        double gn_im = fft_val_n.x * sin_n + fft_val_n.y * cos_n;
+        double gs_re = fft_val_s.x * cos_s - fft_val_s.y * sin_s;
+        double gs_im = fft_val_s.x * sin_s + fft_val_s.y * cos_s;
+
+        // Combine N/S with symmetry
+        R even_re, even_im, odd_re, odd_im;
+        if (is_equator) {
+            // Equator: only one ring, no south partner
+            even_re = R(gn_re);
+            even_im = R(gn_im);
+            odd_re = R(0);
+            odd_im = R(0);
+        } else {
+            even_re = R(gn_re + gs_re);
+            even_im = R(gn_im + gs_im);
+            odd_re  = R(gn_re - gs_re);
+            odd_im  = R(gn_im - gs_im);
+        }
+
+        // Output layout: [n_maps, lp1, n_north_rings]
+        size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+        Gm_even_re[idx] = even_re;
+        Gm_even_im[idx] = even_im;
+        Gm_odd_re[idx]  = odd_re;
+        Gm_odd_im[idx]  = odd_im;
+    }
+
+    // Store geometry (only once per north_ring, thread 0 of m=0, map=0)
+    if (m == 0 && map_idx == 0) {
+        for (int k = threadIdx.x; k < n_eq_north; k += blockDim.x) {
+            int north_ring = nside - 1 + k;
+            int ring_idx = north_ring;  // Ring index in full map
+
+            // Compute geometry for equatorial ring
+            double cos_th = 4.0/3.0 - 2.0 * (ring_idx + 1) / (3.0 * nside);
+            double sin_th = sqrt(1.0 - cos_th * cos_th);
+
+            cos_theta_out[north_ring] = R(cos_th);
+            sin_theta_out[north_ring] = R(sin_th);
+        }
+    }
+}
+
+// Float32 version of phase correction kernel
+// FFT output and phi_0 are float, but Gm output is R (can be double for f32_f64 mode)
+template<typename R>
+__global__ void equatorial_phase_combine_kernel_f32(
+    int nside, int l_max, int n_maps,
+    int fft_size,      // 4*nside
+    int fft_out_size,  // 2*nside+1
+    int n_equatorial,  // 2*nside+1 rings
+    const cufftComplex* __restrict__ fft_out,  // [n_maps, n_equatorial, fft_out_size]
+    const float* __restrict__ phi_0,    // [n_equatorial] - float for f32 FFT
+    R* __restrict__ Gm_even_re,
+    R* __restrict__ Gm_even_im,
+    R* __restrict__ Gm_odd_re,
+    R* __restrict__ Gm_odd_im,
+    R* __restrict__ cos_theta_out,
+    R* __restrict__ sin_theta_out
+) {
+    int m = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int n_north_rings = 2 * nside;
+    int lp1 = l_max + 1;
+    int n_eq_north = nside + 1;
+
+    if (m > l_max || map_idx >= n_maps) return;
+
+    for (int k = threadIdx.x; k < n_eq_north; k += blockDim.x) {
+        int north_ring = nside - 1 + k;
+        bool is_equator = (k == nside);
+
+        int fft_idx_north = k;
+        int fft_idx_south = 2 * nside - k;
+
+        int m_mod = m % fft_size;
+        cufftComplex fft_val_n, fft_val_s;
+
+        size_t fft_base_n = (size_t)map_idx * n_equatorial * fft_out_size + fft_idx_north * fft_out_size;
+        size_t fft_base_s = (size_t)map_idx * n_equatorial * fft_out_size + fft_idx_south * fft_out_size;
+
+        if (m_mod < fft_out_size) {
+            fft_val_n = fft_out[fft_base_n + m_mod];
+            fft_val_s = fft_out[fft_base_s + m_mod];
+        } else {
+            int mirror_m = fft_size - m_mod;
+            fft_val_n = fft_out[fft_base_n + mirror_m];
+            fft_val_n.y = -fft_val_n.y;
+            fft_val_s = fft_out[fft_base_s + mirror_m];
+            fft_val_s.y = -fft_val_s.y;
+        }
+
+        float phi_0_n = phi_0[fft_idx_north];
+        float phi_0_s = phi_0[fft_idx_south];
+
+        float angle_n = -m * phi_0_n;
+        float angle_s = -m * phi_0_s;
+        float cos_n, sin_n, cos_s, sin_s;
+        sincosf(angle_n, &sin_n, &cos_n);
+        sincosf(angle_s, &sin_s, &cos_s);
+
+        float gn_re = fft_val_n.x * cos_n - fft_val_n.y * sin_n;
+        float gn_im = fft_val_n.x * sin_n + fft_val_n.y * cos_n;
+        float gs_re = fft_val_s.x * cos_s - fft_val_s.y * sin_s;
+        float gs_im = fft_val_s.x * sin_s + fft_val_s.y * cos_s;
+
+        R even_re, even_im, odd_re, odd_im;
+        if (is_equator) {
+            even_re = R(gn_re);
+            even_im = R(gn_im);
+            odd_re = R(0);
+            odd_im = R(0);
+        } else {
+            even_re = R(gn_re + gs_re);
+            even_im = R(gn_im + gs_im);
+            odd_re  = R(gn_re - gs_re);
+            odd_im  = R(gn_im - gs_im);
+        }
+
+        size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+        Gm_even_re[idx] = even_re;
+        Gm_even_im[idx] = even_im;
+        Gm_odd_re[idx]  = odd_re;
+        Gm_odd_im[idx]  = odd_im;
+    }
+
+    if (m == 0 && map_idx == 0) {
+        for (int k = threadIdx.x; k < n_eq_north; k += blockDim.x) {
+            int north_ring = nside - 1 + k;
+            int ring_idx = north_ring;
+            float cos_th = 4.0f/3.0f - 2.0f * (ring_idx + 1) / (3.0f * nside);
+            float sin_th = sqrtf(1.0f - cos_th * cos_th);
+            cos_theta_out[north_ring] = R(cos_th);
+            sin_theta_out[north_ring] = R(sin_th);
+        }
+    }
+}
+
+// ============================================================================
+// Bluestein FFT: Compute Gm for ALL rings using chirp-z transform
+// This allows a single batched FFT for all rings regardless of size
+// Algorithm: DFT of size N via convolution in FFT of size M >= 2N-1
+// ============================================================================
+
+// Kernel to apply pre-chirp multiplication and zero-pad for Bluestein
+// Input: map data for one ring
+// Output: chirp-multiplied, zero-padded sequence ready for FFT
+template<typename T>
+__global__ void bluestein_pre_chirp_kernel(
+    int nside, int n_maps, int n_rings,
+    int M,  // Padded FFT size (power of 2)
+    const T* __restrict__ map_in,      // [n_maps, n_rings, max_pix]
+    cufftDoubleComplex* __restrict__ chirped_out,  // [n_maps, n_rings, M]
+    double* __restrict__ cos_theta_out,
+    double* __restrict__ sin_theta_out,
+    int* __restrict__ ring_sizes_out   // [n_rings] - store ring sizes for later
+) {
+    using Traits = V6Traits<T>;
+    using C = typename Traits::compute_t;
+
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    // Compute ring geometry
+    T cos_th, sin_th, phi0;
+    int N;  // Ring size
+    compute_ring_geom_v6<T>(ring_idx, nside, &cos_th, &sin_th, &phi0, &N);
+
+    // Store geometry (only once per ring)
+    if (map_idx == 0 && threadIdx.x == 0) {
+        if (ring_idx < 2 * nside) {  // north ring indices
+            cos_theta_out[ring_idx] = double(cos_th);
+            sin_theta_out[ring_idx] = double(sin_th);
+        }
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    // Get input/output pointers for this ring and map
+    const T* ring_data = map_in + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+    cufftDoubleComplex* chirped = chirped_out + (size_t)map_idx * n_rings * M + ring_idx * M;
+
+    // Each thread handles multiple elements
+    double pi_over_N = M_PI / double(N);
+
+    for (int n = threadIdx.x; n < M; n += blockDim.x) {
+        cufftDoubleComplex val;
+        if (n < N) {
+            // Load input and multiply by pre-chirp: exp(-πi * n² / N)
+            double x = double(Traits::load(&ring_data[n]));
+            double angle = -pi_over_N * double(n) * double(n);
+            double c, s;
+            sincos(angle, &s, &c);
+            val.x = x * c;
+            val.y = x * s;
+        } else {
+            // Zero padding
+            val.x = 0.0;
+            val.y = 0.0;
+        }
+        chirped[n] = val;
+    }
+}
+
+// Float32 version of pre-chirp kernel
+template<typename T>
+__global__ void bluestein_pre_chirp_kernel_f32(
+    int nside, int n_maps, int n_rings,
+    int M,
+    const T* __restrict__ map_in,
+    cufftComplex* __restrict__ chirped_out,
+    float* __restrict__ cos_theta_out,
+    float* __restrict__ sin_theta_out,
+    int* __restrict__ ring_sizes_out
+) {
+    using Traits = V6Traits<T>;
+    using C = typename Traits::compute_t;
+
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int max_pix = 4 * nside;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    T cos_th, sin_th, phi0;
+    int N;
+    compute_ring_geom_v6<T>(ring_idx, nside, &cos_th, &sin_th, &phi0, &N);
+
+    if (map_idx == 0 && threadIdx.x == 0) {
+        if (ring_idx < 2 * nside) {
+            cos_theta_out[ring_idx] = float(cos_th);
+            sin_theta_out[ring_idx] = float(sin_th);
+        }
+        ring_sizes_out[ring_idx] = N;
+    }
+
+    const T* ring_data = map_in + (size_t)map_idx * n_rings * max_pix + ring_idx * max_pix;
+    cufftComplex* chirped = chirped_out + (size_t)map_idx * n_rings * M + ring_idx * M;
+
+    float pi_over_N = float(M_PI) / float(N);
+
+    for (int n = threadIdx.x; n < M; n += blockDim.x) {
+        cufftComplex val;
+        if (n < N) {
+            float x = float(Traits::load(&ring_data[n]));
+            float angle = -pi_over_N * float(n) * float(n);
+            float c, s;
+            sincosf(angle, &s, &c);
+            val.x = x * c;
+            val.y = x * s;
+        } else {
+            val.x = 0.0f;
+            val.y = 0.0f;
+        }
+        chirped[n] = val;
+    }
+}
+
+// Kernel to compute conjugate chirp FFT for all unique ring sizes
+// This is called once and cached
+__global__ void bluestein_compute_conj_chirp_fft_kernel(
+    int nside, int M,
+    cufftDoubleComplex* __restrict__ conj_chirp_fft  // [nside, M] - one per unique ring size
+) {
+    // Each block handles one ring size
+    int size_idx = blockIdx.x;  // 0 = size 4, 1 = size 8, ..., nside-1 = size 4*nside
+    int N = 4 * (size_idx + 1);
+
+    if (N > 4 * nside) return;
+
+    cufftDoubleComplex* chirp = conj_chirp_fft + size_idx * M;
+    double pi_over_N = M_PI / double(N);
+
+    // Fill conjugate chirp with wrap-around for convolution
+    // h'[j] = exp(+πi * j² / N) for j = 0..N-1 and M-N+1..M-1 (wrap-around)
+    for (int j = threadIdx.x; j < M; j += blockDim.x) {
+        cufftDoubleComplex val;
+        int j_eff;  // Effective index for chirp computation
+
+        if (j < N) {
+            j_eff = j;
+        } else if (j >= M - N + 1) {
+            // Wrap-around: position M-k corresponds to -k
+            j_eff = M - j;  // This gives the absolute value
+        } else {
+            // Zero in the middle
+            val.x = 0.0;
+            val.y = 0.0;
+            chirp[j] = val;
+            continue;
+        }
+
+        double angle = pi_over_N * double(j_eff) * double(j_eff);
+        double c, s;
+        sincos(angle, &s, &c);
+        val.x = c;
+        val.y = s;
+        chirp[j] = val;
+    }
+}
+
+// Float32 version of conjugate chirp computation
+__global__ void bluestein_compute_conj_chirp_fft_kernel_f32(
+    int nside, int M,
+    cufftComplex* __restrict__ conj_chirp_fft
+) {
+    int size_idx = blockIdx.x;
+    int N = 4 * (size_idx + 1);
+
+    if (N > 4 * nside) return;
+
+    cufftComplex* chirp = conj_chirp_fft + size_idx * M;
+    float pi_over_N = float(M_PI) / float(N);
+
+    for (int j = threadIdx.x; j < M; j += blockDim.x) {
+        cufftComplex val;
+        int j_eff;
+
+        if (j < N) {
+            j_eff = j;
+        } else if (j >= M - N + 1) {
+            j_eff = M - j;
+        } else {
+            val.x = 0.0f;
+            val.y = 0.0f;
+            chirp[j] = val;
+            continue;
+        }
+
+        float angle = pi_over_N * float(j_eff) * float(j_eff);
+        float c, s;
+        sincosf(angle, &s, &c);
+        val.x = c;
+        val.y = s;
+        chirp[j] = val;
+    }
+}
+
+// Kernel to apply pointwise multiplication with ring-specific conjugate chirp FFT
+__global__ void bluestein_pointwise_mult_kernel(
+    int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,  // [n_rings] - actual ring size N
+    cufftDoubleComplex* __restrict__ fft_data,  // [n_maps, n_rings, M] - in-place
+    const cufftDoubleComplex* __restrict__ conj_chirp_fft  // [nside, M]
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    int size_idx = (N / 4) - 1;  // Index into conj_chirp_fft
+
+    cufftDoubleComplex* data = fft_data + (size_t)map_idx * n_rings * M + ring_idx * M;
+    const cufftDoubleComplex* chirp = conj_chirp_fft + size_idx * M;
+
+    for (int k = threadIdx.x; k < M; k += blockDim.x) {
+        cufftDoubleComplex d = data[k];
+        cufftDoubleComplex h = chirp[k];
+        // Complex multiplication
+        cufftDoubleComplex result;
+        result.x = d.x * h.x - d.y * h.y;
+        result.y = d.x * h.y + d.y * h.x;
+        data[k] = result;
+    }
+}
+
+// Float32 version of pointwise multiplication
+__global__ void bluestein_pointwise_mult_kernel_f32(
+    int n_maps, int n_rings, int M,
+    const int* __restrict__ ring_sizes,
+    cufftComplex* __restrict__ fft_data,
+    const cufftComplex* __restrict__ conj_chirp_fft
+) {
+    int ring_idx = blockIdx.x;
+    int map_idx = blockIdx.y;
+
+    if (ring_idx >= n_rings || map_idx >= n_maps) return;
+
+    int N = ring_sizes[ring_idx];
+    int size_idx = (N / 4) - 1;
+
+    cufftComplex* data = fft_data + (size_t)map_idx * n_rings * M + ring_idx * M;
+    const cufftComplex* chirp = conj_chirp_fft + size_idx * M;
+
+    for (int k = threadIdx.x; k < M; k += blockDim.x) {
+        cufftComplex d = data[k];
+        cufftComplex h = chirp[k];
+        cufftComplex result;
+        result.x = d.x * h.x - d.y * h.y;
+        result.y = d.x * h.y + d.y * h.x;
+        data[k] = result;
+    }
+}
+
+// Kernel to extract Gm values from Bluestein result with post-chirp and phase correction
+// Also combines N/S ring pairs
+template<typename R>
+__global__ void bluestein_extract_gm_kernel(
+    int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
+    int M,
+    const int* __restrict__ ring_sizes,
+    const cufftDoubleComplex* __restrict__ ifft_data,  // [n_maps, n_rings, M]
+    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Gm_even_im,
+    R* __restrict__ Gm_odd_re,
+    R* __restrict__ Gm_odd_im
+) {
+    // Grid: blockIdx.x = north_ring, blockIdx.y = map
+    int north_ring = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+
+    if (north_ring >= n_north_rings || map_idx >= n_maps) return;
+
+    int south_ring = n_rings - 1 - north_ring;
+    bool is_equator = (north_ring == 2 * nside - 1);
+
+    int N_north = ring_sizes[north_ring];
+    int N_south = is_equator ? 0 : ring_sizes[south_ring];
+
+    // IFFT output for this ring (needs normalization by M)
+    const cufftDoubleComplex* ifft_north = ifft_data +
+        (size_t)map_idx * n_rings * M + north_ring * M;
+    const cufftDoubleComplex* ifft_south = is_equator ? nullptr :
+        (ifft_data + (size_t)map_idx * n_rings * M + south_ring * M);
+
+    double pi_over_N_north = M_PI / double(N_north);
+    double pi_over_N_south = is_equator ? 0.0 : M_PI / double(N_south);
+    double inv_M = 1.0 / double(M);
+
+    // Get phi_0 for phase correction
+    double phi0_north, phi0_south;
+    {
+        // Compute phi_0 from ring geometry
+        int ring_i = north_ring + 1;
+        if (ring_i < nside) {
+            phi0_north = M_PI / (2.0 * ring_i) * 0.5;
+        } else if (ring_i <= 3 * nside) {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0_north = M_PI / (2.0 * nside) * (1.0 - s / 2.0);
+        } else {
+            int mirror_i = 4 * nside - ring_i;
+            phi0_north = M_PI / (2.0 * mirror_i) * 0.5;
+        }
+    }
+    if (!is_equator) {
+        int ring_i = south_ring + 1;
+        if (ring_i < nside) {
+            phi0_south = M_PI / (2.0 * ring_i) * 0.5;
+        } else if (ring_i <= 3 * nside) {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0_south = M_PI / (2.0 * nside) * (1.0 - s / 2.0);
+        } else {
+            int mirror_i = 4 * nside - ring_i;
+            phi0_south = M_PI / (2.0 * mirror_i) * 0.5;
+        }
+    }
+
+    // Each thread handles multiple m values
+    for (int m = threadIdx.x; m <= l_max; m += blockDim.x) {
+        // Bluestein gives us DFT output at index k (mod N periodically)
+        // Need to apply post-chirp: multiply by exp(-πi * k² / N)
+        // And phase correction: multiply by exp(-i * m * phi_0)
+
+        // North ring
+        int k_north = m % N_north;
+        cufftDoubleComplex z_north = ifft_north[k_north];
+        // Normalize by M (IFFT normalization)
+        z_north.x *= inv_M;
+        z_north.y *= inv_M;
+        // Post-chirp
+        double post_angle_north = -pi_over_N_north * double(k_north) * double(k_north);
+        double post_c_north, post_s_north;
+        sincos(post_angle_north, &post_s_north, &post_c_north);
+        double gn_re_raw = z_north.x * post_c_north - z_north.y * post_s_north;
+        double gn_im_raw = z_north.x * post_s_north + z_north.y * post_c_north;
+        // Phase correction: exp(-i * m * phi_0)
+        double phase_angle_north = -double(m) * phi0_north;
+        double phase_c_north, phase_s_north;
+        sincos(phase_angle_north, &phase_s_north, &phase_c_north);
+        double gn_re = gn_re_raw * phase_c_north - gn_im_raw * phase_s_north;
+        double gn_im = gn_re_raw * phase_s_north + gn_im_raw * phase_c_north;
+
+        // South ring
+        double gs_re = 0.0, gs_im = 0.0;
+        if (!is_equator && ifft_south != nullptr) {
+            int k_south = m % N_south;
+            cufftDoubleComplex z_south = ifft_south[k_south];
+            z_south.x *= inv_M;
+            z_south.y *= inv_M;
+            double post_angle_south = -pi_over_N_south * double(k_south) * double(k_south);
+            double post_c_south, post_s_south;
+            sincos(post_angle_south, &post_s_south, &post_c_south);
+            double gs_re_raw = z_south.x * post_c_south - z_south.y * post_s_south;
+            double gs_im_raw = z_south.x * post_s_south + z_south.y * post_c_south;
+            double phase_angle_south = -double(m) * phi0_south;
+            double phase_c_south, phase_s_south;
+            sincos(phase_angle_south, &phase_s_south, &phase_c_south);
+            gs_re = gs_re_raw * phase_c_south - gs_im_raw * phase_s_south;
+            gs_im = gs_re_raw * phase_s_south + gs_im_raw * phase_c_south;
+        }
+
+        // Combine N/S with symmetry
+        size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+        Gm_even_re[idx] = R(gn_re + gs_re);
+        Gm_even_im[idx] = R(gn_im + gs_im);
+        Gm_odd_re[idx]  = R(gn_re - gs_re);
+        Gm_odd_im[idx]  = R(gn_im - gs_im);
+    }
+}
+
+// Float32 version of extract kernel
+template<typename R>
+__global__ void bluestein_extract_gm_kernel_f32(
+    int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
+    int M,
+    const int* __restrict__ ring_sizes,
+    const cufftComplex* __restrict__ ifft_data,
+    R* __restrict__ Gm_even_re,
+    R* __restrict__ Gm_even_im,
+    R* __restrict__ Gm_odd_re,
+    R* __restrict__ Gm_odd_im
+) {
+    int north_ring = blockIdx.x;
+    int map_idx = blockIdx.y;
+    int lp1 = l_max + 1;
+
+    if (north_ring >= n_north_rings || map_idx >= n_maps) return;
+
+    int south_ring = n_rings - 1 - north_ring;
+    bool is_equator = (north_ring == 2 * nside - 1);
+
+    int N_north = ring_sizes[north_ring];
+    int N_south = is_equator ? 0 : ring_sizes[south_ring];
+
+    const cufftComplex* ifft_north = ifft_data +
+        (size_t)map_idx * n_rings * M + north_ring * M;
+    const cufftComplex* ifft_south = is_equator ? nullptr :
+        (ifft_data + (size_t)map_idx * n_rings * M + south_ring * M);
+
+    float pi_over_N_north = float(M_PI) / float(N_north);
+    float pi_over_N_south = is_equator ? 0.0f : float(M_PI) / float(N_south);
+    float inv_M = 1.0f / float(M);
+
+    float phi0_north, phi0_south;
+    {
+        int ring_i = north_ring + 1;
+        if (ring_i < nside) {
+            phi0_north = float(M_PI) / float(2 * ring_i) * 0.5f;
+        } else if (ring_i <= 3 * nside) {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0_north = float(M_PI) / float(2 * nside) * (1.0f - s / 2.0f);
+        } else {
+            int mirror_i = 4 * nside - ring_i;
+            phi0_north = float(M_PI) / float(2 * mirror_i) * 0.5f;
+        }
+    }
+    if (!is_equator) {
+        int ring_i = south_ring + 1;
+        if (ring_i < nside) {
+            phi0_south = float(M_PI) / float(2 * ring_i) * 0.5f;
+        } else if (ring_i <= 3 * nside) {
+            int s = (ring_i % 2 == 0) ? 1 : 2;
+            phi0_south = float(M_PI) / float(2 * nside) * (1.0f - s / 2.0f);
+        } else {
+            int mirror_i = 4 * nside - ring_i;
+            phi0_south = float(M_PI) / float(2 * mirror_i) * 0.5f;
+        }
+    }
+
+    for (int m = threadIdx.x; m <= l_max; m += blockDim.x) {
+        int k_north = m % N_north;
+        cufftComplex z_north = ifft_north[k_north];
+        z_north.x *= inv_M;
+        z_north.y *= inv_M;
+        float post_angle_north = -pi_over_N_north * float(k_north) * float(k_north);
+        float post_c_north, post_s_north;
+        sincosf(post_angle_north, &post_s_north, &post_c_north);
+        float gn_re_raw = z_north.x * post_c_north - z_north.y * post_s_north;
+        float gn_im_raw = z_north.x * post_s_north + z_north.y * post_c_north;
+        float phase_angle_north = -float(m) * phi0_north;
+        float phase_c_north, phase_s_north;
+        sincosf(phase_angle_north, &phase_s_north, &phase_c_north);
+        float gn_re = gn_re_raw * phase_c_north - gn_im_raw * phase_s_north;
+        float gn_im = gn_re_raw * phase_s_north + gn_im_raw * phase_c_north;
+
+        float gs_re = 0.0f, gs_im = 0.0f;
+        if (!is_equator && ifft_south != nullptr) {
+            int k_south = m % N_south;
+            cufftComplex z_south = ifft_south[k_south];
+            z_south.x *= inv_M;
+            z_south.y *= inv_M;
+            float post_angle_south = -pi_over_N_south * float(k_south) * float(k_south);
+            float post_c_south, post_s_south;
+            sincosf(post_angle_south, &post_s_south, &post_c_south);
+            float gs_re_raw = z_south.x * post_c_south - z_south.y * post_s_south;
+            float gs_im_raw = z_south.x * post_s_south + z_south.y * post_c_south;
+            float phase_angle_south = -float(m) * phi0_south;
+            float phase_c_south, phase_s_south;
+            sincosf(phase_angle_south, &phase_s_south, &phase_c_south);
+            gs_re = gs_re_raw * phase_c_south - gs_im_raw * phase_s_south;
+            gs_im = gs_re_raw * phase_s_south + gs_im_raw * phase_c_south;
+        }
+
+        size_t idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+        Gm_even_re[idx] = R(gn_re + gs_re);
+        Gm_even_im[idx] = R(gn_im + gs_im);
+        Gm_odd_re[idx]  = R(gn_re - gs_re);
+        Gm_odd_im[idx]  = R(gn_im - gs_im);
     }
 }
 
@@ -472,6 +1279,30 @@ void compute_v6_params(int n_maps, int* ring_batch_size, int* n_maps_parallel) {
     *n_maps_parallel = max_parallel;
 }
 
+// Helper to compute equatorial phi_0 values on GPU
+__global__ void compute_equatorial_phi0_kernel(int nside, int n_equatorial, double* phi_0) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_equatorial) return;
+
+    // Equatorial ring indices: nside-1 to 3*nside-1
+    int ring_idx = nside - 1 + i;  // 0-indexed ring in full map
+    int ring_i = ring_idx + 1;      // 1-indexed for formula
+
+    // phi_0 for equatorial rings: pi/(2*nside) * (1 - s/2) where s = 1 if even ring, 2 if odd
+    int s = ((ring_i - nside) % 2 == 0) ? 1 : 2;
+    phi_0[i] = M_PI / (2.0 * nside) * (1.0 - s / 2.0);
+}
+
+__global__ void compute_equatorial_phi0_kernel_f32(int nside, int n_equatorial, float* phi_0) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_equatorial) return;
+
+    int ring_idx = nside - 1 + i;
+    int ring_i = ring_idx + 1;
+    int s = ((ring_i - nside) % 2 == 0) ? 1 : 2;
+    phi_0[i] = (float)(M_PI / (2.0 * nside) * (1.0 - s / 2.0));
+}
+
 template<typename T, typename R>
 void map2alm_cuda_v6_impl(
     int nside, int l_max, int n_maps,
@@ -504,14 +1335,309 @@ void map2alm_cuda_v6_impl(
     CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
-    // Phase 1: Compute Gm and geometry
-    int block_size_p1 = min(256, lp1);
-    compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
-        nside, l_max, n_maps, n_rings, map_in,
-        Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
-        cos_theta, sin_theta
-    );
-    CUDA_CHECK(cudaGetLastError());
+    // ================================================================
+    // Phase 1: Compute Gm - method selected at runtime
+    // ================================================================
+
+    bool use_double_precision = std::is_same<T, double>::value;
+
+    if (g_phase1_method == Phase1Method::BLUESTEIN) {
+        // ============================================================
+        // BLUESTEIN FFT: All rings processed via chirp-z transform
+        // ============================================================
+
+        // Compute M = next power of 2 >= 2*max_ring_size - 1
+        int max_ring_size = 4 * nside;
+        int M = next_power_of_2(2 * max_ring_size - 1);
+
+        // Allocate buffers
+        int* ring_sizes;
+        CUDA_CHECK(cudaMalloc(&ring_sizes, n_rings * sizeof(int)));
+
+        if (use_double_precision) {
+            // Double precision Bluestein
+            cufftDoubleComplex* chirped_data;
+            cufftDoubleComplex* conj_chirp_fft;
+            double* bs_cos_theta;
+            double* bs_sin_theta;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftDoubleComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftDoubleComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+            CUDA_CHECK(cudaMalloc(&bs_cos_theta, n_north_rings * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&bs_sin_theta, n_north_rings * sizeof(double)));
+
+            // Step 1: Pre-chirp multiplication and padding
+            dim3 grid_pre(n_rings, n_maps);
+            bluestein_pre_chirp_kernel<T><<<grid_pre, 256>>>(
+                nside, n_maps, n_rings, M, map_in,
+                chirped_data, bs_cos_theta, bs_sin_theta, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // Step 2: Compute conjugate chirp for all unique ring sizes and FFT them
+            bluestein_compute_conj_chirp_fft_kernel<<<nside, 256>>>(nside, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            // FFT the conjugate chirps
+            cufftHandle chirp_fft_plan;
+            cufftPlan1d(&chirp_fft_plan, M, CUFFT_Z2Z, nside);
+            cufftExecZ2Z(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+            cufftDestroy(chirp_fft_plan);
+
+            // Step 3: FFT all chirped input data (batched)
+            cufftHandle data_fft_plan;
+            cufftPlan1d(&data_fft_plan, M, CUFFT_Z2Z, n_maps * n_rings);
+            cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
+            CUDA_CHECK(cudaGetLastError());
+
+            // Step 4: Pointwise multiply with ring-specific conjugate chirp FFT
+            bluestein_pointwise_mult_kernel<<<grid_pre, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_data, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // Step 5: IFFT all data (reuse plan)
+            cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
+            cufftDestroy(data_fft_plan);
+            CUDA_CHECK(cudaGetLastError());
+
+            // Step 6: Extract Gm with post-chirp and phase correction
+            dim3 grid_extract(n_north_rings, n_maps);
+            bluestein_extract_gm_kernel<R><<<grid_extract, 256>>>(
+                nside, l_max, n_maps, n_rings, n_north_rings, M,
+                ring_sizes, chirped_data,
+                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // Copy geometry to output buffers (cast from double to R)
+            if (std::is_same<R, double>::value) {
+                CUDA_CHECK(cudaMemcpy(cos_theta, bs_cos_theta, geom_size, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(sin_theta, bs_sin_theta, geom_size, cudaMemcpyDeviceToDevice));
+            } else {
+                // Need to convert double -> float
+                // For simplicity, recompute in Phase 2 kernel or use a conversion kernel
+                // Actually the reduce kernel computes from Gm data, so geometry is needed
+                // Let's use DFT kernel just for geometry if needed, or add a simple conversion
+                int block_geom = 256;
+                int grid_geom = (n_north_rings + block_geom - 1) / block_geom;
+                // Temporary: just use the DFT kernel to compute geometry
+                compute_gm_kernel_v6<T, R><<<n_north_rings, min(256, lp1)>>>(
+                    nside, l_max, 0, n_rings, map_in,  // n_maps=0 to skip Gm computation
+                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    cos_theta, sin_theta
+                );
+            }
+
+            // Cleanup
+            cudaFree(chirped_data);
+            cudaFree(conj_chirp_fft);
+            cudaFree(bs_cos_theta);
+            cudaFree(bs_sin_theta);
+        } else {
+            // Float32 precision Bluestein
+            cufftComplex* chirped_data;
+            cufftComplex* conj_chirp_fft;
+            float* bs_cos_theta;
+            float* bs_sin_theta;
+
+            size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftComplex);
+            size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftComplex);
+
+            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
+            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
+            CUDA_CHECK(cudaMalloc(&bs_cos_theta, n_north_rings * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&bs_sin_theta, n_north_rings * sizeof(float)));
+
+            dim3 grid_pre(n_rings, n_maps);
+            bluestein_pre_chirp_kernel_f32<T><<<grid_pre, 256>>>(
+                nside, n_maps, n_rings, M, map_in,
+                chirped_data, bs_cos_theta, bs_sin_theta, ring_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            bluestein_compute_conj_chirp_fft_kernel_f32<<<nside, 256>>>(nside, M, conj_chirp_fft);
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftHandle chirp_fft_plan;
+            cufftPlan1d(&chirp_fft_plan, M, CUFFT_C2C, nside);
+            cufftExecC2C(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
+            cufftDestroy(chirp_fft_plan);
+
+            cufftHandle data_fft_plan;
+            cufftPlan1d(&data_fft_plan, M, CUFFT_C2C, n_maps * n_rings);
+            cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
+            CUDA_CHECK(cudaGetLastError());
+
+            bluestein_pointwise_mult_kernel_f32<<<grid_pre, 256>>>(
+                n_maps, n_rings, M, ring_sizes, chirped_data, conj_chirp_fft
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
+            cufftDestroy(data_fft_plan);
+            CUDA_CHECK(cudaGetLastError());
+
+            dim3 grid_extract(n_north_rings, n_maps);
+            bluestein_extract_gm_kernel_f32<R><<<grid_extract, 256>>>(
+                nside, l_max, n_maps, n_rings, n_north_rings, M,
+                ring_sizes, chirped_data,
+                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            // Copy geometry
+            if (std::is_same<R, float>::value) {
+                CUDA_CHECK(cudaMemcpy(cos_theta, bs_cos_theta, geom_size, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(sin_theta, bs_sin_theta, geom_size, cudaMemcpyDeviceToDevice));
+            } else {
+                // R is double but T is float - need conversion (unusual case)
+                compute_gm_kernel_v6<T, R><<<n_north_rings, min(256, lp1)>>>(
+                    nside, l_max, 0, n_rings, map_in,
+                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    cos_theta, sin_theta
+                );
+            }
+
+            cudaFree(chirped_data);
+            cudaFree(conj_chirp_fft);
+            cudaFree(bs_cos_theta);
+            cudaFree(bs_sin_theta);
+        }
+
+        cudaFree(ring_sizes);
+
+    } else if (g_phase1_method == Phase1Method::FFT_EQUATORIAL) {
+        // ============================================================
+        // HYBRID FFT/DFT: FFT for equatorial, DFT for polar rings
+        // ============================================================
+
+        // Phase 1a: Polar rings via DFT (nside-1 ring pairs)
+        int n_polar_rings = nside - 1;
+        if (n_polar_rings > 0) {
+            int block_size_polar = min(256, lp1);
+            compute_gm_polar_dft_kernel<T, R><<<n_polar_rings, block_size_polar>>>(
+                nside, l_max, n_maps, n_rings, map_in,
+                Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                cos_theta, sin_theta
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Phase 1b: Equatorial rings via FFT (2*nside+1 rings)
+        int n_equatorial = 2 * nside + 1;
+        int fft_size = 4 * nside;
+        int fft_out_size = fft_size / 2 + 1;
+        int eq_start_ring = nside - 1;
+
+        void* eq_phi_0;
+        if (use_double_precision) {
+            CUDA_CHECK(cudaMalloc(&eq_phi_0, n_equatorial * sizeof(double)));
+            compute_equatorial_phi0_kernel<<<(n_equatorial + 255) / 256, 256>>>(
+                nside, n_equatorial, (double*)eq_phi_0);
+        } else {
+            CUDA_CHECK(cudaMalloc(&eq_phi_0, n_equatorial * sizeof(float)));
+            compute_equatorial_phi0_kernel_f32<<<(n_equatorial + 255) / 256, 256>>>(
+                nside, n_equatorial, (float*)eq_phi_0);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        cufftHandle fft_plan;
+        cufftResult fft_result;
+
+        if (use_double_precision) {
+            fft_result = cufftPlanMany(&fft_plan, 1, &fft_size,
+                NULL, 1, fft_size, NULL, 1, fft_out_size,
+                CUFFT_D2Z, n_equatorial);
+        } else {
+            fft_result = cufftPlanMany(&fft_plan, 1, &fft_size,
+                NULL, 1, fft_size, NULL, 1, fft_out_size,
+                CUFFT_R2C, n_equatorial);
+        }
+
+        if (fft_result != CUFFT_SUCCESS) {
+            fprintf(stderr, "cuFFT plan creation failed: %d, falling back to DFT\n", fft_result);
+            cudaFree(eq_phi_0);
+            goto use_dft_fallback;
+        }
+
+        {
+            size_t fft_out_elem_size = use_double_precision ?
+                                       sizeof(cufftDoubleComplex) : sizeof(cufftComplex);
+            void* fft_out;
+            CUDA_CHECK(cudaMalloc(&fft_out, (size_t)n_maps * n_equatorial * fft_out_size * fft_out_elem_size));
+
+            for (int t = 0; t < n_maps; t++) {
+                const T* eq_map_ptr = map_in + (size_t)t * n_rings * fft_size + eq_start_ring * fft_size;
+
+                if (use_double_precision) {
+                    cufftDoubleComplex* fft_out_ptr = (cufftDoubleComplex*)fft_out +
+                                                      (size_t)t * n_equatorial * fft_out_size;
+                    fft_result = cufftExecD2Z(fft_plan, (cufftDoubleReal*)eq_map_ptr, fft_out_ptr);
+                } else {
+                    cufftComplex* fft_out_ptr = (cufftComplex*)fft_out +
+                                                (size_t)t * n_equatorial * fft_out_size;
+                    fft_result = cufftExecR2C(fft_plan, (cufftReal*)eq_map_ptr, fft_out_ptr);
+                }
+
+                if (fft_result != CUFFT_SUCCESS) {
+                    fprintf(stderr, "cuFFT execution failed: %d\n", fft_result);
+                    cudaFree(fft_out);
+                    cufftDestroy(fft_plan);
+                    cudaFree(eq_phi_0);
+                    goto use_dft_fallback;
+                }
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            dim3 block_phase(128);
+            dim3 grid_phase(lp1, n_maps);
+
+            if (use_double_precision) {
+                equatorial_phase_combine_kernel<R><<<grid_phase, block_phase>>>(
+                    nside, l_max, n_maps, fft_size, fft_out_size, n_equatorial,
+                    (cufftDoubleComplex*)fft_out, (double*)eq_phi_0,
+                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    cos_theta, sin_theta
+                );
+            } else {
+                equatorial_phase_combine_kernel_f32<R><<<grid_phase, block_phase>>>(
+                    nside, l_max, n_maps, fft_size, fft_out_size, n_equatorial,
+                    (cufftComplex*)fft_out, (float*)eq_phi_0,
+                    Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+                    cos_theta, sin_theta
+                );
+            }
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaFree(fft_out);
+            cufftDestroy(fft_plan);
+            cudaFree(eq_phi_0);
+        }
+        goto skip_dft;
+
+    use_dft_fallback:
+        // Fall through to DFT
+        ;
+    }
+
+    if (g_phase1_method == Phase1Method::DFT) {
+        // ============================================================
+        // DFT: Direct DFT for all rings (default, simple)
+        // ============================================================
+        int block_size_p1 = min(256, lp1);
+        compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
+            nside, l_max, n_maps, n_rings, map_in,
+            Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
+            cos_theta, sin_theta
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+skip_dft:
 
     // Compute optimal ring batch size and parallel maps
     int ring_batch_size, n_maps_parallel;
@@ -623,6 +1749,34 @@ void map2alm_cuda_v6(int nside, int l_max, int n_maps,
 
     cudaFree(alm_re);
     cudaFree(alm_im);
+}
+
+// ============================================================================
+// Runtime configuration API
+// ============================================================================
+
+// Set Phase 1 method: 0=DFT (default), 1=FFT_EQUATORIAL, 2=BLUESTEIN
+void map2alm_v6_set_phase1_method(int method) {
+    switch (method) {
+        case 0:
+            g_phase1_method = Phase1Method::DFT;
+            break;
+        case 1:
+            g_phase1_method = Phase1Method::FFT_EQUATORIAL;
+            break;
+        case 2:
+            g_phase1_method = Phase1Method::BLUESTEIN;
+            break;
+        default:
+            fprintf(stderr, "Warning: Unknown phase1 method %d, using DFT\n", method);
+            g_phase1_method = Phase1Method::DFT;
+            break;
+    }
+}
+
+// Get current Phase 1 method
+int map2alm_v6_get_phase1_method() {
+    return static_cast<int>(g_phase1_method);
 }
 
 } // extern "C"

@@ -15,7 +15,8 @@ sys.path.insert(0, '/home/deep/repos/SPHT/cuda/python')
 sys.path.insert(0, '/home/deep/repos/SPHT/jax_healpix')
 
 import jax
-from spht_cuda import SPHTCuda, set_precision, config
+from spht_cuda import (SPHTCuda, set_precision, config,
+                       set_phase1_method, PHASE1_DFT, PHASE1_BLUESTEIN)
 
 # Default parameters
 NSIDE = 64
@@ -70,7 +71,8 @@ def benchmark_jax(nside, l_max, n_iterations, dtype_name):
 
 
 def benchmark_cuda(nside, l_max, n_iterations, storage_precision='float64',
-                   recurrence_precision='float64', version='v5', n_maps=1):
+                   recurrence_precision='float64', version='v5', n_maps=1,
+                   phase1_method=None):
     """Benchmark CUDA map2alm with specified precision.
 
     Args:
@@ -78,7 +80,12 @@ def benchmark_cuda(nside, l_max, n_iterations, storage_precision='float64',
         recurrence_precision: 'float64' or 'float32' for Ylm recurrence
         version: CUDA implementation version ('v4', 'v5', 'v6')
         n_maps: Number of maps to process (array of maps)
+        phase1_method: Phase 1 method for v6 (PHASE1_DFT or PHASE1_BLUESTEIN)
     """
+    # Set phase1 method if specified (v6 only)
+    if phase1_method is not None:
+        set_phase1_method(phase1_method)
+
     spht_cuda = SPHTCuda(nside, l_max, version=version,
                          storage_precision=storage_precision,
                          recurrence_precision=recurrence_precision)
@@ -124,24 +131,30 @@ def run_benchmark(nside, n_iterations):
     results = {}
 
     # CUDA benchmarks with different precision configurations
+    # Format: (name, storage, recurrence, version, phase1_method)
     cuda_configs = [
         # v5 configurations
-        # ('v5_f64_f64', 'float64', 'float64', 'v5'),  # Full float64
-        ('v5_f32_f64', 'float32', 'float64', 'v5'),  # f32 storage, f64 recurrence
-        ('v5_f32_f32', 'float32', 'float32', 'v5'),  # Full float32
-        # v6 configurations
-        ('v6_f64_f64', 'float64', 'float64', 'v6'),  # Full float64
-        ('v6_f32_f64', 'float32', 'float64', 'v6'),  # f32 storage, f64 recurrence
-        ('v6_f32_f32', 'float32', 'float32', 'v6'),  # Full float32
+        # ('v5_f64_f64', 'float64', 'float64', 'v5', None),  # Full float64
+        ('v5_f32_f64', 'float32', 'float64', 'v5', None),  # f32 storage, f64 recurrence
+        ('v5_f32_f32', 'float32', 'float32', 'v5', None),  # Full float32
+        # v6 configurations (DFT - default)
+        ('v6_f64_f64', 'float64', 'float64', 'v6', PHASE1_DFT),  # Full float64
+        ('v6_f32_f64', 'float32', 'float64', 'v6', PHASE1_DFT),  # f32 storage, f64 recurrence
+        ('v6_f32_f32', 'float32', 'float32', 'v6', PHASE1_DFT),  # Full float32
+        # v6 configurations (Bluestein FFT)
+        ('v6_f64_f64_bluestein', 'float64', 'float64', 'v6', PHASE1_BLUESTEIN),  # Full float64 + Bluestein
+        ('v6_f32_f32_bluestein', 'float32', 'float32', 'v6', PHASE1_BLUESTEIN),  # Full float32 + Bluestein
     ]
 
-    for name, storage, recurrence, version in cuda_configs:
-        print(f"Benchmarking CUDA {version} ({storage} storage, {recurrence} recurrence)...")
+    for name, storage, recurrence, version, phase1_method in cuda_configs:
+        method_str = " + Bluestein" if phase1_method == PHASE1_BLUESTEIN else ""
+        print(f"Benchmarking CUDA {version} ({storage} storage, {recurrence} recurrence{method_str})...")
         try:
             mean, std = benchmark_cuda(nside, l_max, n_iterations,
                                        storage_precision=storage,
                                        recurrence_precision=recurrence,
-                                       version=version)
+                                       version=version,
+                                       phase1_method=phase1_method)
             results[name] = (mean, std)
             print(f"  {name}: {mean*1000:.2f} ± {std*1000:.2f} ms")
         except Exception as e:
