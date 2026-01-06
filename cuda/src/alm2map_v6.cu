@@ -656,3 +656,640 @@ void alm2map_cuda_v6(int nside, int l_max, int n_maps,
 }
 
 } // extern "C"
+
+// ============================================================================
+// SPIN-2 IMPLEMENTATION
+// ============================================================================
+// Spin-2 transforms for polarization (E,B) alm -> (Q,U) maps
+// Reference: jax_healpix/SPHT_jax.py alm2map() and alm2ring_ns()
+//
+// alm2map spin-2 (from SPHT_jax.py lines 323-342):
+//   Q = ₂Y×E + i×₋₂Y×B
+//   U = ₋₂Y×E + i×₂Y×B
+//   Post-processing: U *= i, Q *= -1
+//
+// South ring symmetry:
+//   ₂Y(-θ) = (-1)^(l+m) × ₂Y(θ)
+//   ₋₂Y(-θ) = (-1)^(l+m+1) × ₋₂Y(θ)  [extra sign flip!]
+// ============================================================================
+
+// Compute spin-2 normalization factor: sqrt((l-2)!/(l+2)!)
+template<typename C>
+__device__ __forceinline__ C compute_spin2_norm_synth(int l) {
+    if (l < 2) return C(0);
+    C prod = C((l-1) * l) * C((l+1) * (l+2));
+    return C(1.0) / sqrt(prod);
+}
+
+// Compute alpha_{l,m} = sqrt((2l+1)(l²-m²)/(2l-1))
+template<typename C>
+__device__ __forceinline__ C compute_alpha_lm_synth(int l, int m) {
+    if (l <= 1) return C(0);
+    C l2 = C(l * l);
+    C m2 = C(m * m);
+    return sqrt(C(2*l + 1) * (l2 - m2) / C(2*l - 1));
+}
+
+// ============================================================================
+// Spin-2 Phase 1: Compute Fmy for Q and U maps from E,B alm
+// Fmy_Q = ₂Y×E + i×₋₂Y×B  → Fmy_Q_re = ₂Y×E, Fmy_Q_im = ₋₂Y×B
+// Fmy_U = ₋₂Y×E + i×₂Y×B  → Fmy_U_re = ₋₂Y×E, Fmy_U_im = ₂Y×B
+// ============================================================================
+
+template<typename T, typename R>
+__global__ void compute_fmy_spin2_kernel_v6(
+    int nside, int l_max, int n_maps, int n_north_rings,
+    int ring_batch_size,
+    const T* __restrict__ alm_E_re,  // [n_maps, lp1, lp1]
+    const T* __restrict__ alm_E_im,
+    const T* __restrict__ alm_B_re,
+    const T* __restrict__ alm_B_im,
+    R* __restrict__ Fmy_Q_even_re,   // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Fmy_Q_even_im,
+    R* __restrict__ Fmy_Q_odd_re,
+    R* __restrict__ Fmy_Q_odd_im,
+    R* __restrict__ Fmy_U_even_re,
+    R* __restrict__ Fmy_U_even_im,
+    R* __restrict__ Fmy_U_odd_re,
+    R* __restrict__ Fmy_U_odd_im,
+    R* __restrict__ cos_theta_out,
+    R* __restrict__ sin_theta_out
+) {
+    using Traits = V6TraitsSynth<R>;
+    using C = typename Traits::compute_t;
+
+    int m = blockIdx.x;
+    int lane = threadIdx.x;
+    int lp1 = l_max + 1;
+
+    if (m > l_max || lane >= 32) return;
+
+    extern __shared__ char smem[];
+    R* sh_cos_th = (R*)smem;
+    R* sh_sin_th = sh_cos_th + ring_batch_size;
+    T* sh_alm_E_re = (T*)(sh_sin_th + ring_batch_size);
+    T* sh_alm_E_im = sh_alm_E_re + lp1;
+    T* sh_alm_B_re = sh_alm_E_im + lp1;
+    T* sh_alm_B_im = sh_alm_B_re + lp1;
+
+    C Ylm_prev1[MAX_RINGS_PER_LANE];
+    C Ylm_prev2[MAX_RINGS_PER_LANE];
+
+    int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
+
+    for (int batch_start = 0; batch_start < n_north_rings; batch_start += ring_batch_size) {
+        int batch_end = min(batch_start + ring_batch_size, n_north_rings);
+        int batch_size = batch_end - batch_start;
+
+        // Load geometry
+        if (m == 0) {
+            for (int r = lane; r < batch_size; r += 32) {
+                int global_r = batch_start + r;
+                T cos_th, sin_th, phi0;
+                int npix;
+                compute_ring_geom_synth_v6<T>(global_r, nside, &cos_th, &sin_th, &phi0, &npix);
+                sh_cos_th[r] = R(cos_th);
+                sh_sin_th[r] = R(sin_th);
+                if (lane == 0 || r == lane) {
+                    cos_theta_out[global_r] = R(cos_th);
+                    sin_theta_out[global_r] = R(sin_th);
+                }
+            }
+        } else {
+            for (int r = lane; r < batch_size; r += 32) {
+                int global_r = batch_start + r;
+                T cos_th, sin_th, phi0;
+                int npix;
+                compute_ring_geom_synth_v6<T>(global_r, nside, &cos_th, &sin_th, &phi0, &npix);
+                sh_cos_th[r] = R(cos_th);
+                sh_sin_th[r] = R(sin_th);
+            }
+        }
+
+        int k_start = (batch_start > lane) ? (batch_start - lane + 31) / 32 : 0;
+        int k_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
+        k_end = min(k_end, n_my_rings_total);
+
+        // Initialize Y[m,m]
+        for (int k = k_start; k < k_end; k++) {
+            int global_r = lane + 32 * k;
+            int local_r = global_r - batch_start;
+            C sin_th = C(sh_sin_th[local_r]);
+
+            C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
+            for (int j = 1; j <= m; j++) {
+                Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
+            }
+
+            Ylm_prev1[k] = Ymm;
+            Ylm_prev2[k] = C(0);
+        }
+
+        __syncwarp();
+
+        for (int t = 0; t < n_maps; t++) {
+            const T* alm_E_re_t = alm_E_re + (size_t)t * lp1 * lp1;
+            const T* alm_E_im_t = alm_E_im + (size_t)t * lp1 * lp1;
+            const T* alm_B_re_t = alm_B_re + (size_t)t * lp1 * lp1;
+            const T* alm_B_im_t = alm_B_im + (size_t)t * lp1 * lp1;
+
+            // Load alm values (scaled by 2 for m > 0)
+            for (int l = m + lane; l <= l_max; l += 32) {
+                sh_alm_E_re[l] = alm_E_re_t[l * lp1 + m];
+                sh_alm_E_im[l] = alm_E_im_t[l * lp1 + m];
+                sh_alm_B_re[l] = alm_B_re_t[l * lp1 + m];
+                sh_alm_B_im[l] = alm_B_im_t[l * lp1 + m];
+            }
+            __syncwarp();
+
+            for (int k = k_start; k < k_end; k++) {
+                int global_r = lane + 32 * k;
+                int local_r = global_r - batch_start;
+                C cos_th = C(sh_cos_th[local_r]);
+                C sin_th = C(sh_sin_th[local_r]);
+                C sin_th_sq = sin_th * sin_th;
+                C inv_sin_sq = (sin_th_sq > C(1e-20)) ? C(1.0) / sin_th_sq : C(0);
+
+                // Accumulators for Fmy components
+                C fmy_Q_n_re = C(0), fmy_Q_n_im = C(0);
+                C fmy_Q_s_re = C(0), fmy_Q_s_im = C(0);
+                C fmy_U_n_re = C(0), fmy_U_n_im = C(0);
+                C fmy_U_s_re = C(0), fmy_U_s_im = C(0);
+
+                // Recompute Ylm for this ring
+                C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
+                for (int j = 1; j <= m; j++) {
+                    Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
+                }
+
+                // Advance recurrence from l=m to l=l_start-1 for spin-2
+                int l_start = max(2, m);
+                C Ylm_p1 = Ymm;
+                C Ylm_p2 = C(0);
+
+                for (int l = m + 1; l < l_start; l++) {
+                    if (l == m + 1) {
+                        C Yl_new = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_p1;
+                        Ylm_p2 = Ylm_p1;
+                        Ylm_p1 = Yl_new;
+                    } else {
+                        C l2 = C(l * l);
+                        C m2_val = C(m * m);
+                        C lm1_2 = C((l-1) * (l-1));
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_val));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_val) / (l2 - m2_val));
+                        C Yl_new = A * cos_th * Ylm_p1 - B * Ylm_p2;
+                        Ylm_p2 = Ylm_p1;
+                        Ylm_p1 = Yl_new;
+                    }
+                }
+
+                // Process l from l_start to l_max
+                for (int l = l_start; l <= l_max; l++) {
+                    C Ylm, Ylm_prev;
+                    if (l == m) {
+                        Ylm = Ymm;
+                        Ylm_prev = C(0);
+                    } else if (l == m + 1) {
+                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_p1;
+                        Ylm_prev = Ylm_p1;
+                        Ylm_p2 = Ylm_p1;
+                        Ylm_p1 = Ylm;
+                    } else {
+                        C l2 = C(l * l);
+                        C m2_val = C(m * m);
+                        C lm1_2 = C((l-1) * (l-1));
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_val));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_val) / (l2 - m2_val));
+                        Ylm = A * cos_th * Ylm_p1 - B * Ylm_p2;
+                        Ylm_prev = Ylm_p1;
+                        Ylm_p2 = Ylm_p1;
+                        Ylm_p1 = Ylm;
+                    }
+
+                    // Compute spin-2 harmonics
+                    C norm = compute_spin2_norm_synth<C>(l);
+                    C alpha = compute_alpha_lm_synth<C>(l, m);
+                    C m2 = C(m * m);
+                    C ll1 = C(l * (l - 1));
+
+                    C coeff1 = (C(2) * (m2 - C(l)) * inv_sin_sq - ll1);
+                    C coeff2 = C(2) * alpha * cos_th * inv_sin_sq;
+                    C Y2 = norm * (coeff1 * Ylm + coeff2 * Ylm_prev);
+
+                    C inner = alpha * Ylm_prev - C(l - 1) * cos_th * Ylm;
+                    C Ym2 = norm * C(2) * C(m) * inv_sin_sq * inner;
+
+                    // Get alm values
+                    C alm_E_r = C(sh_alm_E_re[l]);
+                    C alm_E_i = C(sh_alm_E_im[l]);
+                    C alm_B_r = C(sh_alm_B_re[l]);
+                    C alm_B_i = C(sh_alm_B_im[l]);
+
+                    // Fmy_Q = ₂Y×E + i×₋₂Y×B
+                    // Fmy_Q_re = ₂Y×E_re - ₋₂Y×B_im, Fmy_Q_im = ₂Y×E_im + ₋₂Y×B_re
+                    C fQ_re = Y2 * alm_E_r - Ym2 * alm_B_i;
+                    C fQ_im = Y2 * alm_E_i + Ym2 * alm_B_r;
+
+                    // Fmy_U = ₋₂Y×E + i×₂Y×B
+                    C fU_re = Ym2 * alm_E_r - Y2 * alm_B_i;
+                    C fU_im = Ym2 * alm_E_i + Y2 * alm_B_r;
+
+                    // North ring
+                    fmy_Q_n_re += fQ_re;
+                    fmy_Q_n_im += fQ_im;
+                    fmy_U_n_re += fU_re;
+                    fmy_U_n_im += fU_im;
+
+                    // South ring: different parity for +2 and -2 spins
+                    int parity_p2 = (l + m) & 1;
+                    int parity_m2 = (l + m + 1) & 1;
+                    C sign_Y2 = parity_p2 ? C(-1) : C(1);
+                    C sign_Ym2 = parity_m2 ? C(-1) : C(1);
+
+                    C Y2_s = sign_Y2 * Y2;
+                    C Ym2_s = sign_Ym2 * Ym2;
+
+                    C fQ_s_re = Y2_s * alm_E_r - Ym2_s * alm_B_i;
+                    C fQ_s_im = Y2_s * alm_E_i + Ym2_s * alm_B_r;
+                    C fU_s_re = Ym2_s * alm_E_r - Y2_s * alm_B_i;
+                    C fU_s_im = Ym2_s * alm_E_i + Y2_s * alm_B_r;
+
+                    fmy_Q_s_re += fQ_s_re;
+                    fmy_Q_s_im += fQ_s_im;
+                    fmy_U_s_re += fU_s_re;
+                    fmy_U_s_im += fU_s_im;
+                }
+
+                // Combine N/S with even/odd decomposition
+                size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + global_r;
+                Fmy_Q_even_re[idx] = R(fmy_Q_n_re + fmy_Q_s_re);
+                Fmy_Q_even_im[idx] = R(fmy_Q_n_im + fmy_Q_s_im);
+                Fmy_Q_odd_re[idx]  = R(fmy_Q_n_re - fmy_Q_s_re);
+                Fmy_Q_odd_im[idx]  = R(fmy_Q_n_im - fmy_Q_s_im);
+                Fmy_U_even_re[idx] = R(fmy_U_n_re + fmy_U_s_re);
+                Fmy_U_even_im[idx] = R(fmy_U_n_im + fmy_U_s_im);
+                Fmy_U_odd_re[idx]  = R(fmy_U_n_re - fmy_U_s_re);
+                Fmy_U_odd_im[idx]  = R(fmy_U_n_im - fmy_U_s_im);
+            }
+
+            __syncwarp();
+        }
+    }
+}
+
+// ============================================================================
+// Spin-2 Phase 2: Synthesize Q,U maps from Fmy via inverse DFT
+// Note: For spin-2, the output is complex-valued before post-processing
+// ============================================================================
+
+template<typename T, typename R>
+__global__ void synthesize_map_spin2_kernel_v6(
+    int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
+    const R* __restrict__ Fmy_Q_even_re,
+    const R* __restrict__ Fmy_Q_even_im,
+    const R* __restrict__ Fmy_Q_odd_re,
+    const R* __restrict__ Fmy_Q_odd_im,
+    const R* __restrict__ Fmy_U_even_re,
+    const R* __restrict__ Fmy_U_even_im,
+    const R* __restrict__ Fmy_U_odd_re,
+    const R* __restrict__ Fmy_U_odd_im,
+    T* __restrict__ map_Q_out,    // Real output (after post-processing)
+    T* __restrict__ map_U_out
+) {
+    using Traits = V6TraitsSynth<R>;
+    using C = typename Traits::compute_t;
+
+    int north_ring = blockIdx.x;
+    int lp1 = l_max + 1;
+    int max_pix = 4 * nside;
+
+    if (north_ring >= n_north_rings) return;
+
+    int south_ring = n_rings - 1 - north_ring;
+    bool is_equator = (north_ring == 2 * nside - 1);
+
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    // Get ring geometry
+    T cos_th_n, sin_th_n, phi0_n;
+    int n_pix_n;
+    compute_ring_geom_synth_v6<T>(north_ring, nside, &cos_th_n, &sin_th_n, &phi0_n, &n_pix_n);
+
+    T cos_th_s, sin_th_s, phi0_s;
+    int n_pix_s = 0;
+    if (!is_equator) {
+        compute_ring_geom_synth_v6<T>(south_ring, nside, &cos_th_s, &sin_th_s, &phi0_s, &n_pix_s);
+    }
+
+    // Shared memory for Fmy values
+    extern __shared__ char shared_mem[];
+    R* sh_fmy_Q_even_re = (R*)shared_mem;
+    R* sh_fmy_Q_even_im = sh_fmy_Q_even_re + lp1;
+    R* sh_fmy_Q_odd_re = sh_fmy_Q_even_im + lp1;
+    R* sh_fmy_Q_odd_im = sh_fmy_Q_odd_re + lp1;
+    R* sh_fmy_U_even_re = sh_fmy_Q_odd_im + lp1;
+    R* sh_fmy_U_even_im = sh_fmy_U_even_re + lp1;
+    R* sh_fmy_U_odd_re = sh_fmy_U_even_im + lp1;
+    R* sh_fmy_U_odd_im = sh_fmy_U_odd_re + lp1;
+
+    for (int t = 0; t < n_maps; t++) {
+        T* map_Q_t = map_Q_out + (size_t)t * n_rings * max_pix;
+        T* map_U_t = map_U_out + (size_t)t * n_rings * max_pix;
+
+        // Load Fmy
+        for (int m = tid; m <= l_max; m += block_size) {
+            size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+            sh_fmy_Q_even_re[m] = Fmy_Q_even_re[idx];
+            sh_fmy_Q_even_im[m] = Fmy_Q_even_im[idx];
+            sh_fmy_Q_odd_re[m] = Fmy_Q_odd_re[idx];
+            sh_fmy_Q_odd_im[m] = Fmy_Q_odd_im[idx];
+            sh_fmy_U_even_re[m] = Fmy_U_even_re[idx];
+            sh_fmy_U_even_im[m] = Fmy_U_even_im[idx];
+            sh_fmy_U_odd_re[m] = Fmy_U_odd_re[idx];
+            sh_fmy_U_odd_im[m] = Fmy_U_odd_im[idx];
+        }
+        __syncthreads();
+
+        // Synthesize north ring pixels
+        for (int j = tid; j < n_pix_n; j += block_size) {
+            C sum_Q_re = C(0), sum_Q_im = C(0);
+            C sum_U_re = C(0), sum_U_im = C(0);
+
+            for (int m = 0; m <= l_max; m++) {
+                C fmy_Q_n_re = C(sh_fmy_Q_even_re[m] + sh_fmy_Q_odd_re[m]) * C(0.5);
+                C fmy_Q_n_im = C(sh_fmy_Q_even_im[m] + sh_fmy_Q_odd_im[m]) * C(0.5);
+                C fmy_U_n_re = C(sh_fmy_U_even_re[m] + sh_fmy_U_odd_re[m]) * C(0.5);
+                C fmy_U_n_im = C(sh_fmy_U_even_im[m] + sh_fmy_U_odd_im[m]) * C(0.5);
+
+                C phi_j = C(phi0_n) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
+                C angle = C(m) * phi_j;
+                C cos_ang, sin_ang;
+                Traits::sincos_d(angle, &sin_ang, &cos_ang);
+
+                // Complex output before Real extraction
+                // Fmy × exp(+im×φ) = (Fmy_re + i×Fmy_im) × (cos + i×sin)
+                // = Fmy_re×cos - Fmy_im×sin + i×(Fmy_re×sin + Fmy_im×cos)
+                sum_Q_re += fmy_Q_n_re * cos_ang - fmy_Q_n_im * sin_ang;
+                sum_Q_im += fmy_Q_n_re * sin_ang + fmy_Q_n_im * cos_ang;
+                sum_U_re += fmy_U_n_re * cos_ang - fmy_U_n_im * sin_ang;
+                sum_U_im += fmy_U_n_re * sin_ang + fmy_U_n_im * cos_ang;
+            }
+
+            // Output: Q = Re(Q_synthesis), U = Re(U_synthesis)
+            // The JAX post-processing (Q *= -1, U *= i) and extraction
+            // (-Re for Q, Im for U) effectively gives Re of raw synthesis
+            map_Q_t[north_ring * max_pix + j] = T(sum_Q_re);
+            map_U_t[north_ring * max_pix + j] = T(sum_U_re);
+        }
+
+        // Synthesize south ring pixels
+        if (!is_equator) {
+            for (int j = tid; j < n_pix_s; j += block_size) {
+                C sum_Q_re = C(0), sum_Q_im = C(0);
+                C sum_U_re = C(0), sum_U_im = C(0);
+
+                for (int m = 0; m <= l_max; m++) {
+                    C fmy_Q_s_re = C(sh_fmy_Q_even_re[m] - sh_fmy_Q_odd_re[m]) * C(0.5);
+                    C fmy_Q_s_im = C(sh_fmy_Q_even_im[m] - sh_fmy_Q_odd_im[m]) * C(0.5);
+                    C fmy_U_s_re = C(sh_fmy_U_even_re[m] - sh_fmy_U_odd_re[m]) * C(0.5);
+                    C fmy_U_s_im = C(sh_fmy_U_even_im[m] - sh_fmy_U_odd_im[m]) * C(0.5);
+
+                    C phi_j = C(phi0_s) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
+                    C angle = C(m) * phi_j;
+                    C cos_ang, sin_ang;
+                    Traits::sincos_d(angle, &sin_ang, &cos_ang);
+
+                    sum_Q_re += fmy_Q_s_re * cos_ang - fmy_Q_s_im * sin_ang;
+                    sum_Q_im += fmy_Q_s_re * sin_ang + fmy_Q_s_im * cos_ang;
+                    sum_U_re += fmy_U_s_re * cos_ang - fmy_U_s_im * sin_ang;
+                    sum_U_im += fmy_U_s_re * sin_ang + fmy_U_s_im * cos_ang;
+                }
+
+                map_Q_t[south_ring * max_pix + j] = T(sum_Q_re);
+                map_U_t[south_ring * max_pix + j] = T(sum_U_re);
+            }
+        }
+
+        __syncthreads();
+    }
+}
+
+// ============================================================================
+// Spin-2 host wrapper
+// ============================================================================
+
+template<typename T, typename R>
+void alm2map_cuda_v6_spin2_impl(
+    int nside, int l_max, int n_maps,
+    const T* alm_E_re, const T* alm_E_im,
+    const T* alm_B_re, const T* alm_B_im,
+    T* map_Q_out, T* map_U_out
+) {
+    int n_rings = 4 * nside - 1;
+    int n_north_rings = 2 * nside;
+    int lp1 = l_max + 1;
+    int max_pix = 4 * nside;
+
+    int rings_per_lane = (n_north_rings + 31) / 32;
+    if (rings_per_lane > MAX_RINGS_PER_LANE) {
+        fprintf(stderr, "Error: nside=%d requires %d rings per lane, max is %d\n",
+                nside, rings_per_lane, MAX_RINGS_PER_LANE);
+        return;
+    }
+
+    static bool timing_enabled = (getenv("SPHT_TIMING") != nullptr);
+    cudaEvent_t start_scale, end_scale, start_p1, end_p1, start_p2, end_p2;
+    if (timing_enabled) {
+        cudaEventCreate(&start_scale);
+        cudaEventCreate(&end_scale);
+        cudaEventCreate(&start_p1);
+        cudaEventCreate(&end_p1);
+        cudaEventCreate(&start_p2);
+        cudaEventCreate(&end_p2);
+        cudaEventRecord(start_scale);
+    }
+
+    // Allocate scaled alm (m>0 multiplied by 2) for both E and B
+    T *alm_E_scaled_re, *alm_E_scaled_im;
+    T *alm_B_scaled_re, *alm_B_scaled_im;
+    size_t alm_size = (size_t)n_maps * lp1 * lp1 * sizeof(T);
+
+    CUDA_CHECK(cudaMalloc(&alm_E_scaled_re, alm_size));
+    CUDA_CHECK(cudaMalloc(&alm_E_scaled_im, alm_size));
+    CUDA_CHECK(cudaMalloc(&alm_B_scaled_re, alm_size));
+    CUDA_CHECK(cudaMalloc(&alm_B_scaled_im, alm_size));
+
+    dim3 block_scale(16, 16);
+    dim3 grid_scale(n_maps, CEILDIV(lp1, 16), CEILDIV(lp1, 16));
+    scale_alm_for_synth_kernel<T><<<grid_scale, block_scale>>>(
+        n_maps, lp1, alm_E_re, alm_E_im, alm_E_scaled_re, alm_E_scaled_im
+    );
+    scale_alm_for_synth_kernel<T><<<grid_scale, block_scale>>>(
+        n_maps, lp1, alm_B_re, alm_B_im, alm_B_scaled_re, alm_B_scaled_im
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    if (timing_enabled) {
+        cudaEventRecord(end_scale);
+        cudaEventRecord(start_p1);
+    }
+
+    // Allocate Fmy buffers
+    size_t fmy_size = (size_t)n_maps * lp1 * n_north_rings * sizeof(R);
+    size_t geom_size = n_north_rings * sizeof(R);
+
+    R *Fmy_Q_even_re, *Fmy_Q_even_im, *Fmy_Q_odd_re, *Fmy_Q_odd_im;
+    R *Fmy_U_even_re, *Fmy_U_even_im, *Fmy_U_odd_re, *Fmy_U_odd_im;
+    R *cos_theta, *sin_theta;
+
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_even_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_even_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_odd_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_odd_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_even_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_even_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_odd_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_odd_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
+    CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
+
+    // Phase 1: Compute Fmy
+    int ring_batch_size = RING_BATCH_SIZE;
+    size_t smem_p1 = 2 * ring_batch_size * sizeof(R) + 4 * lp1 * sizeof(T);
+
+    compute_fmy_spin2_kernel_v6<T, R><<<lp1, 32, smem_p1>>>(
+        nside, l_max, n_maps, n_north_rings,
+        ring_batch_size,
+        alm_E_scaled_re, alm_E_scaled_im,
+        alm_B_scaled_re, alm_B_scaled_im,
+        Fmy_Q_even_re, Fmy_Q_even_im, Fmy_Q_odd_re, Fmy_Q_odd_im,
+        Fmy_U_even_re, Fmy_U_even_im, Fmy_U_odd_re, Fmy_U_odd_im,
+        cos_theta, sin_theta
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    if (timing_enabled) {
+        cudaEventRecord(end_p1);
+        cudaEventRecord(start_p2);
+    }
+
+    // Initialize output maps to zero
+    CUDA_CHECK(cudaMemset(map_Q_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
+    CUDA_CHECK(cudaMemset(map_U_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
+
+    // Phase 2: Synthesize maps
+    size_t smem_p2 = 8 * lp1 * sizeof(R);
+    int block_size_p2 = 256;
+
+    synthesize_map_spin2_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
+        nside, l_max, n_maps, n_rings, n_north_rings,
+        Fmy_Q_even_re, Fmy_Q_even_im, Fmy_Q_odd_re, Fmy_Q_odd_im,
+        Fmy_U_even_re, Fmy_U_even_im, Fmy_U_odd_re, Fmy_U_odd_im,
+        map_Q_out, map_U_out
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (timing_enabled) {
+        cudaEventRecord(end_p2);
+        cudaEventSynchronize(end_p2);
+
+        float scale_ms, p1_ms, p2_ms;
+        cudaEventElapsedTime(&scale_ms, start_scale, end_scale);
+        cudaEventElapsedTime(&p1_ms, start_p1, end_p1);
+        cudaEventElapsedTime(&p2_ms, start_p2, end_p2);
+
+        fprintf(stderr, "[SPHT_TIMING] spin2 alm2map nside=%d l_max=%d n_maps=%d Scale=%.2fms Phase1=%.2fms Phase2=%.2fms Total=%.2fms\n",
+                nside, l_max, n_maps, scale_ms, p1_ms, p2_ms, scale_ms + p1_ms + p2_ms);
+
+        cudaEventDestroy(start_scale);
+        cudaEventDestroy(end_scale);
+        cudaEventDestroy(start_p1);
+        cudaEventDestroy(end_p1);
+        cudaEventDestroy(start_p2);
+        cudaEventDestroy(end_p2);
+    }
+
+    // Cleanup
+    cudaFree(alm_E_scaled_re);
+    cudaFree(alm_E_scaled_im);
+    cudaFree(alm_B_scaled_re);
+    cudaFree(alm_B_scaled_im);
+    cudaFree(Fmy_Q_even_re);
+    cudaFree(Fmy_Q_even_im);
+    cudaFree(Fmy_Q_odd_re);
+    cudaFree(Fmy_Q_odd_im);
+    cudaFree(Fmy_U_even_re);
+    cudaFree(Fmy_U_even_im);
+    cudaFree(Fmy_U_odd_re);
+    cudaFree(Fmy_U_odd_im);
+    cudaFree(cos_theta);
+    cudaFree(sin_theta);
+}
+
+// ============================================================================
+// Spin-2 C API entry points
+// ============================================================================
+
+extern "C" {
+
+void alm2map_cuda_v6_spin2_f64_f64(int nside, int l_max, int n_maps,
+                                    const double* alm_E_re, const double* alm_E_im,
+                                    const double* alm_B_re, const double* alm_B_im,
+                                    double* map_Q_out, double* map_U_out) {
+    alm2map_cuda_v6_spin2_impl<double, double>(nside, l_max, n_maps,
+                                                alm_E_re, alm_E_im,
+                                                alm_B_re, alm_B_im,
+                                                map_Q_out, map_U_out);
+}
+
+void alm2map_cuda_v6_spin2_f64_f32(int nside, int l_max, int n_maps,
+                                    const double* alm_E_re, const double* alm_E_im,
+                                    const double* alm_B_re, const double* alm_B_im,
+                                    double* map_Q_out, double* map_U_out) {
+    alm2map_cuda_v6_spin2_impl<double, float>(nside, l_max, n_maps,
+                                               alm_E_re, alm_E_im,
+                                               alm_B_re, alm_B_im,
+                                               map_Q_out, map_U_out);
+}
+
+void alm2map_cuda_v6_spin2_f32_f64(int nside, int l_max, int n_maps,
+                                    const float* alm_E_re, const float* alm_E_im,
+                                    const float* alm_B_re, const float* alm_B_im,
+                                    float* map_Q_out, float* map_U_out) {
+    alm2map_cuda_v6_spin2_impl<float, double>(nside, l_max, n_maps,
+                                               alm_E_re, alm_E_im,
+                                               alm_B_re, alm_B_im,
+                                               map_Q_out, map_U_out);
+}
+
+void alm2map_cuda_v6_spin2_f32_f32(int nside, int l_max, int n_maps,
+                                    const float* alm_E_re, const float* alm_E_im,
+                                    const float* alm_B_re, const float* alm_B_im,
+                                    float* map_Q_out, float* map_U_out) {
+    alm2map_cuda_v6_spin2_impl<float, float>(nside, l_max, n_maps,
+                                              alm_E_re, alm_E_im,
+                                              alm_B_re, alm_B_im,
+                                              map_Q_out, map_U_out);
+}
+
+// Convenience aliases
+void alm2map_cuda_v6_spin2_f64(int nside, int l_max, int n_maps,
+                                const double* alm_E_re, const double* alm_E_im,
+                                const double* alm_B_re, const double* alm_B_im,
+                                double* map_Q_out, double* map_U_out) {
+    alm2map_cuda_v6_spin2_f64_f64(nside, l_max, n_maps, alm_E_re, alm_E_im,
+                                   alm_B_re, alm_B_im, map_Q_out, map_U_out);
+}
+
+void alm2map_cuda_v6_spin2_f32(int nside, int l_max, int n_maps,
+                                const float* alm_E_re, const float* alm_E_im,
+                                const float* alm_B_re, const float* alm_B_im,
+                                float* map_Q_out, float* map_U_out) {
+    alm2map_cuda_v6_spin2_f32_f32(nside, l_max, n_maps, alm_E_re, alm_E_im,
+                                   alm_B_re, alm_B_im, map_Q_out, map_U_out);
+}
+
+} // extern "C" for spin-2

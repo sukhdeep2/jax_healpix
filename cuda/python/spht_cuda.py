@@ -225,6 +225,34 @@ def _setup_functions(lib):
     lib.alm2map_cuda_v6_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
     lib.alm2map_cuda_v6_f32.restype = None
 
+    # ========== V6 Spin-2: map2alm Q,U -> E,B ==========
+    # Args: (nside, l_max, n_maps, d_map_Q, d_map_U, d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag)
+    lib.map2alm_cuda_v6_spin2_f64_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_spin2_f64_f64.restype = None
+
+    lib.map2alm_cuda_v6_spin2_f64_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_spin2_f64_f32.restype = None
+
+    lib.map2alm_cuda_v6_spin2_f32_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_spin2_f32_f64.restype = None
+
+    lib.map2alm_cuda_v6_spin2_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_spin2_f32_f32.restype = None
+
+    # ========== V6 Spin-2: alm2map E,B -> Q,U ==========
+    # Args: (nside, l_max, n_maps, d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag, d_map_Q, d_map_U)
+    lib.alm2map_cuda_v6_spin2_f64_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2map_cuda_v6_spin2_f64_f64.restype = None
+
+    lib.alm2map_cuda_v6_spin2_f64_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2map_cuda_v6_spin2_f64_f32.restype = None
+
+    lib.alm2map_cuda_v6_spin2_f32_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2map_cuda_v6_spin2_f32_f64.restype = None
+
+    lib.alm2map_cuda_v6_spin2_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2map_cuda_v6_spin2_f32_f32.restype = None
+
     # alm2map_cuda_v5 precision combinations
     # f64_f64: float64 storage, float64 recurrence (default, highest accuracy)
     lib.alm2map_cuda_v5_f64_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
@@ -451,23 +479,21 @@ class SPHTCuda:
         Transform HEALPix maps to spherical harmonic coefficients.
 
         Args:
-            maps: Dict with keys in {0, 2, -2} for spin types.
-                  Each value is array of shape [n_maps, n_rings, 4*nside]
-                  or [n_maps, npix] in 1D HEALPix format.
-            spins: Tuple of spins to compute, e.g., (0,) or (0, 2)
+            maps: Dict with keys in {0, 2} for spin types.
+                  For spin-0: Each value is array of shape [n_maps, n_rings, 4*nside]
+                              or [n_maps, npix] in 1D HEALPix format.
+                  For spin-2: Each value is array of shape [n_maps, n_rings, 4*nside, 2]
+                              where last dimension is (Q, U).
+            spins: Tuple of spins to compute, e.g., (0,) or (0, 2) or (2,)
             return_split: If True, return (alm_real, alm_imag) tuple instead of
                          complex array. This avoids the ~50ms combine overhead.
                          Use combine_to_complex() to convert to complex when needed.
 
         Returns:
-            alm: Dict with same keys. If return_split=False (default):
-                 each value is shape [n_maps, l_max+1, l_max+1] complex array.
-                 If return_split=True: each value is tuple (alm_real, alm_imag)
-                 where each is shape [n_maps, l_max+1, l_max+1] real array.
+            alm: Dict with same keys.
+                 For spin-0: shape [n_maps, l_max+1, l_max+1] complex array (or split)
+                 For spin-2: shape [n_maps, l_max+1, l_max+1, 2] where last dim is (E, B)
         """
-        if 0 not in spins:
-            raise NotImplementedError("Only spin-0 is currently implemented")
-
         alm_out = {}
         use_f32 = (self.storage_precision == "float32")
 
@@ -475,33 +501,54 @@ class SPHTCuda:
             if s not in maps:
                 continue
 
-            # Convert to appropriate dtype
-            dtype = np.float32 if use_f32 else np.float64
-            map_data = np.asarray(maps[s], dtype=dtype)
+            if s == 2:
+                # Spin-2 transform (Q, U) -> (E, B)
+                if self.version != "v6":
+                    raise NotImplementedError("Spin-2 only supported in v6")
 
-            # Handle 1D HEALPix format
-            if map_data.ndim == 1:
-                map_data = map_data.reshape(1, -1)
-            if map_data.ndim == 2 and map_data.shape[1] == 12 * self.nside**2:
-                map_data = self._reshape_maps_to_2d(map_data, dtype=dtype)
+                map_data = np.asarray(maps[s])
+                if map_data.ndim == 3:
+                    # Shape [n_maps, npix, 2] - need to reshape
+                    raise ValueError("Spin-2 maps must have shape [n_maps, n_rings, 4*nside, 2]")
+                if map_data.ndim != 4 or map_data.shape[-1] != 2:
+                    raise ValueError(f"Spin-2 maps must have shape [n_maps, n_rings, 4*nside, 2], got {map_data.shape}")
 
-            n_maps = map_data.shape[0]
-            map_data = np.ascontiguousarray(map_data)
+                dtype = np.float32 if use_f32 else np.float64
+                map_data = map_data.astype(dtype)
+                n_maps = map_data.shape[0]
 
-            # For v5/v6 with precision control, use direct kernel calls
-            if self.version == "v6":
-                alm_data = self._map2alm_v6(map_data, n_maps, return_split=return_split)
-            elif self.version == "v5":
-                alm_data = self._map2alm_v5(map_data, n_maps, return_split=return_split)
+                alm_data = self._map2alm_spin2_v6(map_data, n_maps, return_split=return_split)
+                alm_out[s] = alm_data
+            elif s == 0:
+                # Spin-0 transform
+                dtype = np.float32 if use_f32 else np.float64
+                map_data = np.asarray(maps[s], dtype=dtype)
+
+                # Handle 1D HEALPix format
+                if map_data.ndim == 1:
+                    map_data = map_data.reshape(1, -1)
+                if map_data.ndim == 2 and map_data.shape[1] == 12 * self.nside**2:
+                    map_data = self._reshape_maps_to_2d(map_data, dtype=dtype)
+
+                n_maps = map_data.shape[0]
+                map_data = np.ascontiguousarray(map_data)
+
+                # For v5/v6 with precision control, use direct kernel calls
+                if self.version == "v6":
+                    alm_data = self._map2alm_v6(map_data, n_maps, return_split=return_split)
+                elif self.version == "v5":
+                    alm_data = self._map2alm_v5(map_data, n_maps, return_split=return_split)
+                else:
+                    # Legacy versions use float64 only and don't support return_split
+                    if return_split:
+                        raise NotImplementedError("return_split only supported for v5/v6")
+                    if use_f32:
+                        map_data = map_data.astype(np.float64)
+                    alm_data = self._map2alm_legacy(map_data, n_maps)
+
+                alm_out[s] = alm_data
             else:
-                # Legacy versions use float64 only and don't support return_split
-                if return_split:
-                    raise NotImplementedError("return_split only supported for v5/v6")
-                if use_f32:
-                    map_data = map_data.astype(np.float64)
-                alm_data = self._map2alm_legacy(map_data, n_maps)
-
-            alm_out[s] = alm_data
+                raise NotImplementedError(f"Spin {s} not supported. Use spin=0 or spin=2.")
 
         return alm_out
 
@@ -732,6 +779,125 @@ class SPHTCuda:
 
             return alm_data
 
+    def _map2alm_spin2_v6(self, map_data: np.ndarray, n_maps: int, return_split: bool = False):
+        """Run v6 spin-2 transform (Q, U) -> (E, B).
+
+        Args:
+            map_data: Input map array of shape [n_maps, n_rings, 4*nside, 2]
+                      where last dimension is (Q, U)
+            n_maps: Number of maps
+            return_split: If True, return split real/imag arrays
+
+        Returns:
+            If return_split=False: complex array of shape [n_maps, l_max+1, l_max+1, 2]
+                                   where last dim is (E, B)
+            If return_split=True: tuple ((E_real, E_imag), (B_real, B_imag))
+        """
+        use_f32 = (self.storage_precision == "float32")
+        use_f32_recur = (self.recurrence_precision == "float32")
+        lp1 = self.l_max + 1
+
+        # Extract Q and U maps - shape [n_maps, n_rings, max_pix]
+        map_Q = np.ascontiguousarray(map_data[..., 0])
+        map_U = np.ascontiguousarray(map_data[..., 1])
+
+        # Sizes
+        map_size = n_maps * self.n_rings * 4 * self.nside * map_Q.itemsize
+        alm_size = n_maps * lp1 * lp1 * map_Q.itemsize
+
+        # Use cached CUDA runtime
+        cuda_rt = _get_cuda_rt()
+
+        # Allocate device memory
+        d_map_Q = ctypes.c_void_p()
+        d_map_U = ctypes.c_void_p()
+        d_alm_E_real = ctypes.c_void_p()
+        d_alm_E_imag = ctypes.c_void_p()
+        d_alm_B_real = ctypes.c_void_p()
+        d_alm_B_imag = ctypes.c_void_p()
+
+        cuda_rt.cudaMalloc(ctypes.byref(d_map_Q), map_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_map_U), map_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_E_real), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_E_imag), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_B_real), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_B_imag), alm_size)
+
+        cuda_rt.cudaMemset(d_alm_E_real, 0, alm_size)
+        cuda_rt.cudaMemset(d_alm_E_imag, 0, alm_size)
+        cuda_rt.cudaMemset(d_alm_B_real, 0, alm_size)
+        cuda_rt.cudaMemset(d_alm_B_imag, 0, alm_size)
+
+        # Copy maps to device
+        cuda_rt.cudaMemcpy(d_map_Q, map_Q.ctypes.data_as(c_void_p), map_size, 1)
+        cuda_rt.cudaMemcpy(d_map_U, map_U.ctypes.data_as(c_void_p), map_size, 1)
+
+        try:
+            # Select kernel based on precision combination
+            if use_f32:
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_spin2_f32_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map_Q, d_map_U,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_spin2_f32_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map_Q, d_map_U,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag)
+            else:
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_spin2_f64_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map_Q, d_map_U,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_spin2_f64_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map_Q, d_map_U,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag)
+
+            # Allocate host arrays
+            np_dtype = np.float32 if use_f32 else np.float64
+            E_real = np.zeros((n_maps, lp1, lp1), dtype=np_dtype)
+            E_imag = np.zeros((n_maps, lp1, lp1), dtype=np_dtype)
+            B_real = np.zeros((n_maps, lp1, lp1), dtype=np_dtype)
+            B_imag = np.zeros((n_maps, lp1, lp1), dtype=np_dtype)
+
+            # Copy results back
+            cuda_rt.cudaMemcpy(E_real.ctypes.data_as(c_void_p), d_alm_E_real, alm_size, 2)
+            cuda_rt.cudaMemcpy(E_imag.ctypes.data_as(c_void_p), d_alm_E_imag, alm_size, 2)
+            cuda_rt.cudaMemcpy(B_real.ctypes.data_as(c_void_p), d_alm_B_real, alm_size, 2)
+            cuda_rt.cudaMemcpy(B_imag.ctypes.data_as(c_void_p), d_alm_B_imag, alm_size, 2)
+
+        finally:
+            cuda_rt.cudaFree(d_map_Q)
+            cuda_rt.cudaFree(d_map_U)
+            cuda_rt.cudaFree(d_alm_E_real)
+            cuda_rt.cudaFree(d_alm_E_imag)
+            cuda_rt.cudaFree(d_alm_B_real)
+            cuda_rt.cudaFree(d_alm_B_imag)
+
+        # Apply JAX-compatible post-processing:
+        # JAX does: alm[2] *= -1, alm[-2] *= 1j
+        # E_final = -E_raw = -(E_re + i*E_im)
+        # B_final = i*B_raw = i*(B_re + i*B_im) = -B_im + i*B_re
+        E_real_final = -E_real
+        E_imag_final = -E_imag
+        B_real_final = -B_imag
+        B_imag_final = B_real
+
+        if return_split:
+            return ((E_real_final, E_imag_final), (B_real_final, B_imag_final))
+        else:
+            # Combine to complex arrays with shape [n_maps, lp1, lp1, 2]
+            complex_dtype = np.complex64 if use_f32 else np.complex128
+            alm_E = (E_real_final + 1j * E_imag_final).astype(complex_dtype)
+            alm_B = (B_real_final + 1j * B_imag_final).astype(complex_dtype)
+            # Stack E and B along last dimension
+            alm_out = np.stack([alm_E, alm_B], axis=-1)
+            return alm_out
+
     def _map2alm_legacy(self, map_data: np.ndarray, n_maps: int) -> np.ndarray:
         """Run legacy (v1-v4) transform."""
         # Allocate device memory
@@ -784,16 +950,17 @@ class SPHTCuda:
         Transform spherical harmonic coefficients to HEALPix maps.
 
         Args:
-            alm: Dict with keys in {0, 2, -2} for spin types.
-                 Each value is array of shape [n_maps, l_max+1, l_max+1]
-            spins: Tuple of spins to compute
+            alm: Dict with keys in {0, 2} for spin types.
+                 For spin-0: Each value is array of shape [n_maps, l_max+1, l_max+1]
+                 For spin-2: Each value is array of shape [n_maps, l_max+1, l_max+1, 2]
+                             where last dimension is (E, B)
+            spins: Tuple of spins to compute, e.g., (0,) or (0, 2) or (2,)
 
         Returns:
-            maps: Dict with same keys, each of shape [n_maps, n_rings, 4*nside]
+            maps: Dict with same keys.
+                  For spin-0: shape [n_maps, n_rings, 4*nside]
+                  For spin-2: shape [n_maps, n_rings, 4*nside, 2] where last dim is (Q, U)
         """
-        if 0 not in spins:
-            raise NotImplementedError("Only spin-0 is currently implemented")
-
         maps_out = {}
         use_f32 = (self.storage_precision == "float32")
 
@@ -801,15 +968,30 @@ class SPHTCuda:
             if s not in alm:
                 continue
 
-            # For v6/v5 with precision control
-            if self.version == "v6":
-                map_data = self._alm2map_v6(alm[s])
-            elif self.version == "v5":
-                map_data = self._alm2map_v5(alm[s])
-            else:
-                map_data = self._alm2map_legacy(alm[s])
+            if s == 2:
+                # Spin-2 transform (E, B) -> (Q, U)
+                if self.version != "v6":
+                    raise NotImplementedError("Spin-2 only supported in v6")
 
-            maps_out[s] = map_data
+                alm_data = np.asarray(alm[s])
+                if alm_data.ndim != 4 or alm_data.shape[-1] != 2:
+                    raise ValueError(f"Spin-2 alm must have shape [n_maps, l_max+1, l_max+1, 2], got {alm_data.shape}")
+
+                map_data = self._alm2map_spin2_v6(alm_data)
+                maps_out[s] = map_data
+            elif s == 0:
+                # Spin-0 transform
+                # For v6/v5 with precision control
+                if self.version == "v6":
+                    map_data = self._alm2map_v6(alm[s])
+                elif self.version == "v5":
+                    map_data = self._alm2map_v5(alm[s])
+                else:
+                    map_data = self._alm2map_legacy(alm[s])
+
+                maps_out[s] = map_data
+            else:
+                raise NotImplementedError(f"Spin {s} not supported. Use spin=0 or spin=2.")
 
         return maps_out
 
@@ -1024,6 +1206,121 @@ class SPHTCuda:
                   f"free={1000*(t_free-t_d2h):.2f}ms "
                   f"TOTAL={1000*(t_free-t0):.2f}ms")
 
+        return map_out
+
+    def _alm2map_spin2_v6(self, alm_data: np.ndarray) -> np.ndarray:
+        """Run v6 spin-2 alm2map transform (E, B) -> (Q, U).
+
+        Args:
+            alm_data: Input alm array of shape [n_maps, l_max+1, l_max+1, 2]
+                      where last dimension is (E, B) in JAX convention:
+                      - E_alm = -E_raw (from map2alm post-processing)
+                      - B_alm = i*B_raw (from map2alm post-processing)
+
+        Returns:
+            map_out: Output map array of shape [n_maps, n_rings, 4*nside, 2]
+                     where last dimension is (Q, U)
+        """
+        use_f32 = (self.storage_precision == "float32")
+        use_f32_recur = (self.recurrence_precision == "float32")
+        lp1 = self.l_max + 1
+
+        # Convert to appropriate dtype
+        if use_f32:
+            alm_data = np.asarray(alm_data, dtype=np.complex64)
+            np_dtype = np.float32
+        else:
+            alm_data = np.asarray(alm_data, dtype=np.complex128)
+            np_dtype = np.float64
+
+        if alm_data.ndim == 3:
+            alm_data = alm_data.reshape(1, alm_data.shape[0], alm_data.shape[1], alm_data.shape[2])
+
+        n_maps = alm_data.shape[0]
+
+        # Extract E and B alm - shape [n_maps, lp1, lp1]
+        # Input is in JAX convention: E_alm = -E_raw, B_alm = i*B_raw
+        alm_E = np.ascontiguousarray(alm_data[..., 0])
+        alm_B = np.ascontiguousarray(alm_data[..., 1])
+
+        # Pass JAX-formatted alm directly to CUDA kernel
+        # The kernel will handle the conventions internally
+        E_real = np.ascontiguousarray(alm_E.real.astype(np_dtype))
+        E_imag = np.ascontiguousarray(alm_E.imag.astype(np_dtype))
+        B_real = np.ascontiguousarray(alm_B.real.astype(np_dtype))
+        B_imag = np.ascontiguousarray(alm_B.imag.astype(np_dtype))
+
+        # Sizes
+        alm_size = n_maps * lp1 * lp1 * E_real.itemsize
+        map_size = n_maps * self.n_rings * 4 * self.nside * E_real.itemsize
+
+        # Use cached CUDA runtime
+        cuda_rt = _get_cuda_rt()
+
+        # Allocate device memory
+        d_alm_E_real = ctypes.c_void_p()
+        d_alm_E_imag = ctypes.c_void_p()
+        d_alm_B_real = ctypes.c_void_p()
+        d_alm_B_imag = ctypes.c_void_p()
+        d_map_Q = ctypes.c_void_p()
+        d_map_U = ctypes.c_void_p()
+
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_E_real), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_E_imag), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_B_real), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_alm_B_imag), alm_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_map_Q), map_size)
+        cuda_rt.cudaMalloc(ctypes.byref(d_map_U), map_size)
+
+        # Copy alm to device
+        cuda_rt.cudaMemcpy(d_alm_E_real, E_real.ctypes.data_as(c_void_p), alm_size, 1)
+        cuda_rt.cudaMemcpy(d_alm_E_imag, E_imag.ctypes.data_as(c_void_p), alm_size, 1)
+        cuda_rt.cudaMemcpy(d_alm_B_real, B_real.ctypes.data_as(c_void_p), alm_size, 1)
+        cuda_rt.cudaMemcpy(d_alm_B_imag, B_imag.ctypes.data_as(c_void_p), alm_size, 1)
+
+        try:
+            # Select kernel based on precision combination
+            if use_f32:
+                if use_f32_recur:
+                    self._lib.alm2map_cuda_v6_spin2_f32_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag,
+                        d_map_Q, d_map_U)
+                else:
+                    self._lib.alm2map_cuda_v6_spin2_f32_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag,
+                        d_map_Q, d_map_U)
+            else:
+                if use_f32_recur:
+                    self._lib.alm2map_cuda_v6_spin2_f64_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag,
+                        d_map_Q, d_map_U)
+                else:
+                    self._lib.alm2map_cuda_v6_spin2_f64_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_alm_E_real, d_alm_E_imag, d_alm_B_real, d_alm_B_imag,
+                        d_map_Q, d_map_U)
+
+            # Allocate output arrays
+            map_Q = np.zeros((n_maps, self.n_rings, 4 * self.nside), dtype=np_dtype)
+            map_U = np.zeros((n_maps, self.n_rings, 4 * self.nside), dtype=np_dtype)
+
+            # Copy results back
+            cuda_rt.cudaMemcpy(map_Q.ctypes.data_as(c_void_p), d_map_Q, map_size, 2)
+            cuda_rt.cudaMemcpy(map_U.ctypes.data_as(c_void_p), d_map_U, map_size, 2)
+
+        finally:
+            cuda_rt.cudaFree(d_alm_E_real)
+            cuda_rt.cudaFree(d_alm_E_imag)
+            cuda_rt.cudaFree(d_alm_B_real)
+            cuda_rt.cudaFree(d_alm_B_imag)
+            cuda_rt.cudaFree(d_map_Q)
+            cuda_rt.cudaFree(d_map_U)
+
+        # Stack Q and U along last dimension
+        map_out = np.stack([map_Q, map_U], axis=-1)
         return map_out
 
     def _alm2map_legacy(self, alm_data: np.ndarray) -> np.ndarray:
