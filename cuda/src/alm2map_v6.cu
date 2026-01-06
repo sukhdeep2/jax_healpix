@@ -442,6 +442,39 @@ __global__ void scale_alm_for_synth_kernel(
     alm_out_imag[idx] = alm_in_imag[idx] * scale;
 }
 
+// Spin-2 scaling kernel: applies both m>0 factor (×2) AND norm(l) pre-scaling
+// norm(l) = 1/sqrt((l-1)*l*(l+1)*(l+2)) for l >= 2, 0 otherwise
+template<typename T>
+__global__ void scale_alm_spin2_for_synth_kernel(
+    int n_maps, int lp1,
+    const T* __restrict__ alm_in_real,
+    const T* __restrict__ alm_in_imag,
+    T* __restrict__ alm_out_real,
+    T* __restrict__ alm_out_imag
+) {
+    int t = blockIdx.x;
+    int l = blockIdx.y * blockDim.x + threadIdx.x;
+    int m = blockIdx.z * blockDim.y + threadIdx.y;
+
+    if (t >= n_maps || l >= lp1 || m > l) return;
+
+    size_t idx = (size_t)t * lp1 * lp1 + l * lp1 + m;
+
+    // Compute combined scale: (m>0 ? 2 : 1) × norm(l)
+    T scale;
+    if (l < 2) {
+        scale = T(0);  // No spin-2 contribution for l < 2
+    } else {
+        T m_factor = (m > 0) ? T(2.0) : T(1.0);
+        // norm = 1/sqrt((l-1)*l*(l+1)*(l+2))
+        T prod = T((l-1) * l) * T((l+1) * (l+2));
+        T norm = T(1.0) / sqrt(prod);
+        scale = m_factor * norm;
+    }
+    alm_out_real[idx] = alm_in_real[idx] * scale;
+    alm_out_imag[idx] = alm_in_imag[idx] * scale;
+}
+
 // ============================================================================
 // Host wrapper implementation
 // ============================================================================
@@ -707,14 +740,14 @@ __global__ void compute_fmy_spin2_kernel_v6(
     const T* __restrict__ alm_E_im,
     const T* __restrict__ alm_B_re,
     const T* __restrict__ alm_B_im,
-    R* __restrict__ Fmy_Q_even_re,   // [n_maps, lp1, n_north_rings]
-    R* __restrict__ Fmy_Q_even_im,
-    R* __restrict__ Fmy_Q_odd_re,
-    R* __restrict__ Fmy_Q_odd_im,
-    R* __restrict__ Fmy_U_even_re,
-    R* __restrict__ Fmy_U_even_im,
-    R* __restrict__ Fmy_U_odd_re,
-    R* __restrict__ Fmy_U_odd_im,
+    R* __restrict__ Fmy_Q_north_re,  // [n_maps, lp1, n_north_rings]
+    R* __restrict__ Fmy_Q_north_im,
+    R* __restrict__ Fmy_Q_south_re,
+    R* __restrict__ Fmy_Q_south_im,
+    R* __restrict__ Fmy_U_north_re,
+    R* __restrict__ Fmy_U_north_im,
+    R* __restrict__ Fmy_U_south_re,
+    R* __restrict__ Fmy_U_south_im,
     R* __restrict__ cos_theta_out,
     R* __restrict__ sin_theta_out
 ) {
@@ -873,17 +906,16 @@ __global__ void compute_fmy_spin2_kernel_v6(
                         Ylm_p1 = Ylm;
                     }
 
-                    // Compute spin-2 harmonics
-                    C norm = compute_spin2_norm_synth<C>(l);
+                    // Compute spin-2 harmonics (norm already pre-scaled into alm)
                     C alpha = compute_alpha_lm_synth<C>(l, m);
                     C ll1 = C(l * (l - 1));
 
                     C coeff1 = (C(2) * (m2_precomp - C(l)) * inv_sin_sq - ll1);
                     C coeff2 = C(2) * alpha * cos_th * inv_sin_sq;
-                    C Y2 = norm * (coeff1 * Ylm + coeff2 * Ylm_prev);
+                    C Y2 = coeff1 * Ylm + coeff2 * Ylm_prev;
 
                     C inner = alpha * Ylm_prev - C(l - 1) * cos_th * Ylm;
-                    C Ym2 = norm * two_m_precomp * inv_sin_sq * inner;
+                    C Ym2 = two_m_precomp * inv_sin_sq * inner;
 
                     // Get alm values
                     C alm_E_r = C(sh_alm_E_re[l]);
@@ -926,16 +958,16 @@ __global__ void compute_fmy_spin2_kernel_v6(
                     fmy_U_s_im += fU_s_im;
                 }
 
-                // Combine N/S with even/odd decomposition
+                // Store north/south Fmy directly (no even/odd combination)
                 size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + global_r;
-                Fmy_Q_even_re[idx] = R(fmy_Q_n_re + fmy_Q_s_re);
-                Fmy_Q_even_im[idx] = R(fmy_Q_n_im + fmy_Q_s_im);
-                Fmy_Q_odd_re[idx]  = R(fmy_Q_n_re - fmy_Q_s_re);
-                Fmy_Q_odd_im[idx]  = R(fmy_Q_n_im - fmy_Q_s_im);
-                Fmy_U_even_re[idx] = R(fmy_U_n_re + fmy_U_s_re);
-                Fmy_U_even_im[idx] = R(fmy_U_n_im + fmy_U_s_im);
-                Fmy_U_odd_re[idx]  = R(fmy_U_n_re - fmy_U_s_re);
-                Fmy_U_odd_im[idx]  = R(fmy_U_n_im - fmy_U_s_im);
+                Fmy_Q_north_re[idx] = R(fmy_Q_n_re);
+                Fmy_Q_north_im[idx] = R(fmy_Q_n_im);
+                Fmy_Q_south_re[idx] = R(fmy_Q_s_re);
+                Fmy_Q_south_im[idx] = R(fmy_Q_s_im);
+                Fmy_U_north_re[idx] = R(fmy_U_n_re);
+                Fmy_U_north_im[idx] = R(fmy_U_n_im);
+                Fmy_U_south_re[idx] = R(fmy_U_s_re);
+                Fmy_U_south_im[idx] = R(fmy_U_s_im);
             }
 
             __syncwarp();
@@ -951,14 +983,14 @@ __global__ void compute_fmy_spin2_kernel_v6(
 template<typename T, typename R>
 __global__ void synthesize_map_spin2_kernel_v6(
     int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
-    const R* __restrict__ Fmy_Q_even_re,
-    const R* __restrict__ Fmy_Q_even_im,
-    const R* __restrict__ Fmy_Q_odd_re,
-    const R* __restrict__ Fmy_Q_odd_im,
-    const R* __restrict__ Fmy_U_even_re,
-    const R* __restrict__ Fmy_U_even_im,
-    const R* __restrict__ Fmy_U_odd_re,
-    const R* __restrict__ Fmy_U_odd_im,
+    const R* __restrict__ Fmy_Q_north_re,
+    const R* __restrict__ Fmy_Q_north_im,
+    const R* __restrict__ Fmy_Q_south_re,
+    const R* __restrict__ Fmy_Q_south_im,
+    const R* __restrict__ Fmy_U_north_re,
+    const R* __restrict__ Fmy_U_north_im,
+    const R* __restrict__ Fmy_U_south_re,
+    const R* __restrict__ Fmy_U_south_im,
     T* __restrict__ map_Q_out,    // Real output (after post-processing)
     T* __restrict__ map_U_out
 ) {
@@ -988,32 +1020,26 @@ __global__ void synthesize_map_spin2_kernel_v6(
         compute_ring_geom_synth_v6<T>(south_ring, nside, &cos_th_s, &sin_th_s, &phi0_s, &n_pix_s);
     }
 
-    // Shared memory for Fmy values
+    // Shared memory for Fmy values - only 4 arrays at a time (Q/U × re/im)
+    // Process north and south separately to halve shared memory requirement
     extern __shared__ char shared_mem[];
-    R* sh_fmy_Q_even_re = (R*)shared_mem;
-    R* sh_fmy_Q_even_im = sh_fmy_Q_even_re + lp1;
-    R* sh_fmy_Q_odd_re = sh_fmy_Q_even_im + lp1;
-    R* sh_fmy_Q_odd_im = sh_fmy_Q_odd_re + lp1;
-    R* sh_fmy_U_even_re = sh_fmy_Q_odd_im + lp1;
-    R* sh_fmy_U_even_im = sh_fmy_U_even_re + lp1;
-    R* sh_fmy_U_odd_re = sh_fmy_U_even_im + lp1;
-    R* sh_fmy_U_odd_im = sh_fmy_U_odd_re + lp1;
+    R* sh_fmy_Q_re = (R*)shared_mem;
+    R* sh_fmy_Q_im = sh_fmy_Q_re + lp1;
+    R* sh_fmy_U_re = sh_fmy_Q_im + lp1;
+    R* sh_fmy_U_im = sh_fmy_U_re + lp1;
 
     for (int t = 0; t < n_maps; t++) {
         T* map_Q_t = map_Q_out + (size_t)t * n_rings * max_pix;
         T* map_U_t = map_U_out + (size_t)t * n_rings * max_pix;
 
-        // Load Fmy
+        // === North ring pass ===
+        // Load Fmy_north directly (no arithmetic needed)
         for (int m = tid; m <= l_max; m += block_size) {
             size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
-            sh_fmy_Q_even_re[m] = Fmy_Q_even_re[idx];
-            sh_fmy_Q_even_im[m] = Fmy_Q_even_im[idx];
-            sh_fmy_Q_odd_re[m] = Fmy_Q_odd_re[idx];
-            sh_fmy_Q_odd_im[m] = Fmy_Q_odd_im[idx];
-            sh_fmy_U_even_re[m] = Fmy_U_even_re[idx];
-            sh_fmy_U_even_im[m] = Fmy_U_even_im[idx];
-            sh_fmy_U_odd_re[m] = Fmy_U_odd_re[idx];
-            sh_fmy_U_odd_im[m] = Fmy_U_odd_im[idx];
+            sh_fmy_Q_re[m] = Fmy_Q_north_re[idx];
+            sh_fmy_Q_im[m] = Fmy_Q_north_im[idx];
+            sh_fmy_U_re[m] = Fmy_U_north_re[idx];
+            sh_fmy_U_im[m] = Fmy_U_north_im[idx];
         }
         __syncthreads();
 
@@ -1022,62 +1048,69 @@ __global__ void synthesize_map_spin2_kernel_v6(
             C sum_Q_re = C(0), sum_Q_im = C(0);
             C sum_U_re = C(0), sum_U_im = C(0);
 
-            for (int m = 0; m <= l_max; m++) {
-                C fmy_Q_n_re = C(sh_fmy_Q_even_re[m] + sh_fmy_Q_odd_re[m]) * C(0.5);
-                C fmy_Q_n_im = C(sh_fmy_Q_even_im[m] + sh_fmy_Q_odd_im[m]) * C(0.5);
-                C fmy_U_n_re = C(sh_fmy_U_even_re[m] + sh_fmy_U_odd_re[m]) * C(0.5);
-                C fmy_U_n_im = C(sh_fmy_U_even_im[m] + sh_fmy_U_odd_im[m]) * C(0.5);
+            C phi_j = C(phi0_n) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
 
-                C phi_j = C(phi0_n) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_n);
+            for (int m = 0; m <= l_max; m++) {
+                C fmy_Q_re = C(sh_fmy_Q_re[m]);
+                C fmy_Q_im = C(sh_fmy_Q_im[m]);
+                C fmy_U_re = C(sh_fmy_U_re[m]);
+                C fmy_U_im = C(sh_fmy_U_im[m]);
+
                 C angle = C(m) * phi_j;
                 C cos_ang, sin_ang;
                 Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
-                // Complex output before Real extraction
-                // Fmy × exp(+im×φ) = (Fmy_re + i×Fmy_im) × (cos + i×sin)
-                // = Fmy_re×cos - Fmy_im×sin + i×(Fmy_re×sin + Fmy_im×cos)
-                sum_Q_re += fmy_Q_n_re * cos_ang - fmy_Q_n_im * sin_ang;
-                sum_Q_im += fmy_Q_n_re * sin_ang + fmy_Q_n_im * cos_ang;
-                sum_U_re += fmy_U_n_re * cos_ang - fmy_U_n_im * sin_ang;
-                sum_U_im += fmy_U_n_re * sin_ang + fmy_U_n_im * cos_ang;
+                sum_Q_re += fmy_Q_re * cos_ang - fmy_Q_im * sin_ang;
+                sum_Q_im += fmy_Q_re * sin_ang + fmy_Q_im * cos_ang;
+                sum_U_re += fmy_U_re * cos_ang - fmy_U_im * sin_ang;
+                sum_U_im += fmy_U_re * sin_ang + fmy_U_im * cos_ang;
             }
 
-            // Output: Q = Re(Q_synthesis), U = Re(U_synthesis)
-            // The JAX post-processing (Q *= -1, U *= i) and extraction
-            // (-Re for Q, Im for U) effectively gives Re of raw synthesis
             map_Q_t[north_ring * max_pix + j] = T(sum_Q_re);
             map_U_t[north_ring * max_pix + j] = T(sum_U_re);
         }
+        __syncthreads();
 
-        // Synthesize south ring pixels
+        // === South ring pass ===
         if (!is_equator) {
+            // Load Fmy_south directly (no arithmetic needed)
+            for (int m = tid; m <= l_max; m += block_size) {
+                size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
+                sh_fmy_Q_re[m] = Fmy_Q_south_re[idx];
+                sh_fmy_Q_im[m] = Fmy_Q_south_im[idx];
+                sh_fmy_U_re[m] = Fmy_U_south_re[idx];
+                sh_fmy_U_im[m] = Fmy_U_south_im[idx];
+            }
+            __syncthreads();
+
+            // Synthesize south ring pixels
             for (int j = tid; j < n_pix_s; j += block_size) {
                 C sum_Q_re = C(0), sum_Q_im = C(0);
                 C sum_U_re = C(0), sum_U_im = C(0);
 
-                for (int m = 0; m <= l_max; m++) {
-                    C fmy_Q_s_re = C(sh_fmy_Q_even_re[m] - sh_fmy_Q_odd_re[m]) * C(0.5);
-                    C fmy_Q_s_im = C(sh_fmy_Q_even_im[m] - sh_fmy_Q_odd_im[m]) * C(0.5);
-                    C fmy_U_s_re = C(sh_fmy_U_even_re[m] - sh_fmy_U_odd_re[m]) * C(0.5);
-                    C fmy_U_s_im = C(sh_fmy_U_even_im[m] - sh_fmy_U_odd_im[m]) * C(0.5);
+                C phi_j = C(phi0_s) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
 
-                    C phi_j = C(phi0_s) + C(j) * C(2.0 * Traits::PI_VAL) / C(n_pix_s);
+                for (int m = 0; m <= l_max; m++) {
+                    C fmy_Q_re = C(sh_fmy_Q_re[m]);
+                    C fmy_Q_im = C(sh_fmy_Q_im[m]);
+                    C fmy_U_re = C(sh_fmy_U_re[m]);
+                    C fmy_U_im = C(sh_fmy_U_im[m]);
+
                     C angle = C(m) * phi_j;
                     C cos_ang, sin_ang;
                     Traits::sincos_d(angle, &sin_ang, &cos_ang);
 
-                    sum_Q_re += fmy_Q_s_re * cos_ang - fmy_Q_s_im * sin_ang;
-                    sum_Q_im += fmy_Q_s_re * sin_ang + fmy_Q_s_im * cos_ang;
-                    sum_U_re += fmy_U_s_re * cos_ang - fmy_U_s_im * sin_ang;
-                    sum_U_im += fmy_U_s_re * sin_ang + fmy_U_s_im * cos_ang;
+                    sum_Q_re += fmy_Q_re * cos_ang - fmy_Q_im * sin_ang;
+                    sum_Q_im += fmy_Q_re * sin_ang + fmy_Q_im * cos_ang;
+                    sum_U_re += fmy_U_re * cos_ang - fmy_U_im * sin_ang;
+                    sum_U_im += fmy_U_re * sin_ang + fmy_U_im * cos_ang;
                 }
 
                 map_Q_t[south_ring * max_pix + j] = T(sum_Q_re);
                 map_U_t[south_ring * max_pix + j] = T(sum_U_re);
             }
+            __syncthreads();
         }
-
-        __syncthreads();
     }
 }
 
@@ -1128,10 +1161,11 @@ void alm2map_cuda_v6_spin2_impl(
 
     dim3 block_scale(16, 16);
     dim3 grid_scale(n_maps, CEILDIV(lp1, 16), CEILDIV(lp1, 16));
-    scale_alm_for_synth_kernel<T><<<grid_scale, block_scale>>>(
+    // Use spin-2 scaling kernel that includes norm(l) pre-scaling
+    scale_alm_spin2_for_synth_kernel<T><<<grid_scale, block_scale>>>(
         n_maps, lp1, alm_E_re, alm_E_im, alm_E_scaled_re, alm_E_scaled_im
     );
-    scale_alm_for_synth_kernel<T><<<grid_scale, block_scale>>>(
+    scale_alm_spin2_for_synth_kernel<T><<<grid_scale, block_scale>>>(
         n_maps, lp1, alm_B_re, alm_B_im, alm_B_scaled_re, alm_B_scaled_im
     );
     CUDA_CHECK(cudaGetLastError());
@@ -1145,18 +1179,18 @@ void alm2map_cuda_v6_spin2_impl(
     size_t fmy_size = (size_t)n_maps * lp1 * n_north_rings * sizeof(R);
     size_t geom_size = n_north_rings * sizeof(R);
 
-    R *Fmy_Q_even_re, *Fmy_Q_even_im, *Fmy_Q_odd_re, *Fmy_Q_odd_im;
-    R *Fmy_U_even_re, *Fmy_U_even_im, *Fmy_U_odd_re, *Fmy_U_odd_im;
+    R *Fmy_Q_north_re, *Fmy_Q_north_im, *Fmy_Q_south_re, *Fmy_Q_south_im;
+    R *Fmy_U_north_re, *Fmy_U_north_im, *Fmy_U_south_re, *Fmy_U_south_im;
     R *cos_theta, *sin_theta;
 
-    CUDA_CHECK(cudaMalloc(&Fmy_Q_even_re, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_Q_even_im, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_Q_odd_re, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_Q_odd_im, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_U_even_re, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_U_even_im, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_U_odd_re, fmy_size));
-    CUDA_CHECK(cudaMalloc(&Fmy_U_odd_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_north_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_north_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_south_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_Q_south_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_north_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_north_im, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_south_re, fmy_size));
+    CUDA_CHECK(cudaMalloc(&Fmy_U_south_im, fmy_size));
     CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
@@ -1193,8 +1227,8 @@ void alm2map_cuda_v6_spin2_impl(
         ring_batch_size,
         alm_E_scaled_re, alm_E_scaled_im,
         alm_B_scaled_re, alm_B_scaled_im,
-        Fmy_Q_even_re, Fmy_Q_even_im, Fmy_Q_odd_re, Fmy_Q_odd_im,
-        Fmy_U_even_re, Fmy_U_even_im, Fmy_U_odd_re, Fmy_U_odd_im,
+        Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
+        Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
         cos_theta, sin_theta
     );
     CUDA_CHECK(cudaGetLastError());
@@ -1209,8 +1243,8 @@ void alm2map_cuda_v6_spin2_impl(
     CUDA_CHECK(cudaMemset(map_U_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
 
     // Phase 2: Synthesize maps
-    // Spin-2 needs 8 Fmy arrays (Q/U × even/odd × re/im)
-    size_t smem_p2 = 8 * lp1 * sizeof(R);
+    // Uses 4 shared memory arrays (Q/U × re/im) - processes north/south separately
+    size_t smem_p2 = 4 * lp1 * sizeof(R);
     int block_size_p2 = 256;
 
     // Request extended shared memory if needed
@@ -1223,13 +1257,13 @@ void alm2map_cuda_v6_spin2_impl(
                     "(l_max=%d), but GPU limit exceeded.\n"
                     "Try using float32 storage precision for large nside.\n",
                     smem_p2, l_max);
-            // Clean up allocated memory
+            // Clean up
             cudaFree(alm_E_scaled_re); cudaFree(alm_E_scaled_im);
             cudaFree(alm_B_scaled_re); cudaFree(alm_B_scaled_im);
-            cudaFree(Fmy_Q_even_re); cudaFree(Fmy_Q_even_im);
-            cudaFree(Fmy_Q_odd_re); cudaFree(Fmy_Q_odd_im);
-            cudaFree(Fmy_U_even_re); cudaFree(Fmy_U_even_im);
-            cudaFree(Fmy_U_odd_re); cudaFree(Fmy_U_odd_im);
+            cudaFree(Fmy_Q_north_re); cudaFree(Fmy_Q_north_im);
+            cudaFree(Fmy_Q_south_re); cudaFree(Fmy_Q_south_im);
+            cudaFree(Fmy_U_north_re); cudaFree(Fmy_U_north_im);
+            cudaFree(Fmy_U_south_re); cudaFree(Fmy_U_south_im);
             cudaFree(cos_theta); cudaFree(sin_theta);
             return;
         }
@@ -1237,8 +1271,8 @@ void alm2map_cuda_v6_spin2_impl(
 
     synthesize_map_spin2_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
         nside, l_max, n_maps, n_rings, n_north_rings,
-        Fmy_Q_even_re, Fmy_Q_even_im, Fmy_Q_odd_re, Fmy_Q_odd_im,
-        Fmy_U_even_re, Fmy_U_even_im, Fmy_U_odd_re, Fmy_U_odd_im,
+        Fmy_Q_north_re, Fmy_Q_north_im, Fmy_Q_south_re, Fmy_Q_south_im,
+        Fmy_U_north_re, Fmy_U_north_im, Fmy_U_south_re, Fmy_U_south_im,
         map_Q_out, map_U_out
     );
     CUDA_CHECK(cudaGetLastError());
@@ -1269,14 +1303,14 @@ void alm2map_cuda_v6_spin2_impl(
     cudaFree(alm_E_scaled_im);
     cudaFree(alm_B_scaled_re);
     cudaFree(alm_B_scaled_im);
-    cudaFree(Fmy_Q_even_re);
-    cudaFree(Fmy_Q_even_im);
-    cudaFree(Fmy_Q_odd_re);
-    cudaFree(Fmy_Q_odd_im);
-    cudaFree(Fmy_U_even_re);
-    cudaFree(Fmy_U_even_im);
-    cudaFree(Fmy_U_odd_re);
-    cudaFree(Fmy_U_odd_im);
+    cudaFree(Fmy_Q_north_re);
+    cudaFree(Fmy_Q_north_im);
+    cudaFree(Fmy_Q_south_re);
+    cudaFree(Fmy_Q_south_im);
+    cudaFree(Fmy_U_north_re);
+    cudaFree(Fmy_U_north_im);
+    cudaFree(Fmy_U_south_re);
+    cudaFree(Fmy_U_south_im);
     cudaFree(cos_theta);
     cudaFree(sin_theta);
 }
