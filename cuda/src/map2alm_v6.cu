@@ -35,6 +35,50 @@ enum class Phase1Method {
 // Global configuration - can be changed at runtime
 static Phase1Method g_phase1_method = Phase1Method::DFT;
 
+// ============================================================================
+// cuFFT Plan Cache for Bluestein FFT
+// ============================================================================
+
+#include <map>
+#include <mutex>
+
+struct CufftPlanKey {
+    int fft_size;
+    int batch;
+    cufftType type;  // CUFFT_Z2Z or CUFFT_C2C
+
+    bool operator<(const CufftPlanKey& other) const {
+        if (fft_size != other.fft_size) return fft_size < other.fft_size;
+        if (batch != other.batch) return batch < other.batch;
+        return type < other.type;
+    }
+};
+
+static std::map<CufftPlanKey, cufftHandle> g_cufft_plan_cache;
+static std::mutex g_plan_cache_mutex;
+
+// Get or create a cached cuFFT plan
+static cufftHandle get_cached_plan(int fft_size, int batch, cufftType type) {
+    CufftPlanKey key = {fft_size, batch, type};
+
+    std::lock_guard<std::mutex> lock(g_plan_cache_mutex);
+    auto it = g_cufft_plan_cache.find(key);
+    if (it != g_cufft_plan_cache.end()) {
+        return it->second;
+    }
+
+    // Create new plan
+    cufftHandle plan;
+    cufftResult result = cufftPlan1d(&plan, fft_size, type, batch);
+    if (result != CUFFT_SUCCESS) {
+        fprintf(stderr, "cuFFT plan creation failed: %d\n", result);
+        return 0;
+    }
+
+    g_cufft_plan_cache[key] = plan;
+    return plan;
+}
+
 // Helper to get next power of 2
 __host__ __device__ inline int next_power_of_2(int n) {
     n--;
@@ -1339,6 +1383,17 @@ void map2alm_cuda_v6_impl(
     // Phase 1: Compute Gm - method selected at runtime
     // ================================================================
 
+    // Timing events (enabled via environment variable)
+    static bool timing_enabled = (getenv("SPHT_TIMING") != nullptr);
+    cudaEvent_t start_p1, end_p1, start_p2, end_p2;
+    if (timing_enabled) {
+        cudaEventCreate(&start_p1);
+        cudaEventCreate(&end_p1);
+        cudaEventCreate(&start_p2);
+        cudaEventCreate(&end_p2);
+        cudaEventRecord(start_p1);
+    }
+
     bool use_double_precision = std::is_same<T, double>::value;
 
     if (g_phase1_method == Phase1Method::BLUESTEIN) {
@@ -1381,15 +1436,12 @@ void map2alm_cuda_v6_impl(
             bluestein_compute_conj_chirp_fft_kernel<<<nside, 256>>>(nside, M, conj_chirp_fft);
             CUDA_CHECK(cudaGetLastError());
 
-            // FFT the conjugate chirps
-            cufftHandle chirp_fft_plan;
-            cufftPlan1d(&chirp_fft_plan, M, CUFFT_Z2Z, nside);
+            // FFT the conjugate chirps (use cached plan)
+            cufftHandle chirp_fft_plan = get_cached_plan(M, nside, CUFFT_Z2Z);
             cufftExecZ2Z(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
-            cufftDestroy(chirp_fft_plan);
 
-            // Step 3: FFT all chirped input data (batched)
-            cufftHandle data_fft_plan;
-            cufftPlan1d(&data_fft_plan, M, CUFFT_Z2Z, n_maps * n_rings);
+            // Step 3: FFT all chirped input data (batched, use cached plan)
+            cufftHandle data_fft_plan = get_cached_plan(M, n_maps * n_rings, CUFFT_Z2Z);
             cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
             CUDA_CHECK(cudaGetLastError());
 
@@ -1399,9 +1451,8 @@ void map2alm_cuda_v6_impl(
             );
             CUDA_CHECK(cudaGetLastError());
 
-            // Step 5: IFFT all data (reuse plan)
+            // Step 5: IFFT all data (reuse cached plan)
             cufftExecZ2Z(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
-            cufftDestroy(data_fft_plan);
             CUDA_CHECK(cudaGetLastError());
 
             // Step 6: Extract Gm with post-chirp and phase correction
@@ -1462,13 +1513,11 @@ void map2alm_cuda_v6_impl(
             bluestein_compute_conj_chirp_fft_kernel_f32<<<nside, 256>>>(nside, M, conj_chirp_fft);
             CUDA_CHECK(cudaGetLastError());
 
-            cufftHandle chirp_fft_plan;
-            cufftPlan1d(&chirp_fft_plan, M, CUFFT_C2C, nside);
+            // Use cached plans for float32
+            cufftHandle chirp_fft_plan = get_cached_plan(M, nside, CUFFT_C2C);
             cufftExecC2C(chirp_fft_plan, conj_chirp_fft, conj_chirp_fft, CUFFT_FORWARD);
-            cufftDestroy(chirp_fft_plan);
 
-            cufftHandle data_fft_plan;
-            cufftPlan1d(&data_fft_plan, M, CUFFT_C2C, n_maps * n_rings);
+            cufftHandle data_fft_plan = get_cached_plan(M, n_maps * n_rings, CUFFT_C2C);
             cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_FORWARD);
             CUDA_CHECK(cudaGetLastError());
 
@@ -1478,7 +1527,6 @@ void map2alm_cuda_v6_impl(
             CUDA_CHECK(cudaGetLastError());
 
             cufftExecC2C(data_fft_plan, chirped_data, chirped_data, CUFFT_INVERSE);
-            cufftDestroy(data_fft_plan);
             CUDA_CHECK(cudaGetLastError());
 
             dim3 grid_extract(n_north_rings, n_maps);
@@ -1639,6 +1687,12 @@ void map2alm_cuda_v6_impl(
 
 skip_dft:
 
+    // End Phase 1 timing, start Phase 2 timing
+    if (timing_enabled) {
+        cudaEventRecord(end_p1);
+        cudaEventRecord(start_p2);
+    }
+
     // Compute optimal ring batch size and parallel maps
     int ring_batch_size, n_maps_parallel;
     compute_v6_params<R>(n_maps, &ring_batch_size, &n_maps_parallel);
@@ -1659,6 +1713,24 @@ skip_dft:
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // End Phase 2 timing and report
+    if (timing_enabled) {
+        cudaEventRecord(end_p2);
+        cudaEventSynchronize(end_p2);
+
+        float p1_ms, p2_ms;
+        cudaEventElapsedTime(&p1_ms, start_p1, end_p1);
+        cudaEventElapsedTime(&p2_ms, start_p2, end_p2);
+
+        fprintf(stderr, "[SPHT_TIMING] nside=%d l_max=%d n_maps=%d Phase1=%.2fms Phase2=%.2fms Total=%.2fms\n",
+                nside, l_max, n_maps, p1_ms, p2_ms, p1_ms + p2_ms);
+
+        cudaEventDestroy(start_p1);
+        cudaEventDestroy(end_p1);
+        cudaEventDestroy(start_p2);
+        cudaEventDestroy(end_p2);
+    }
 
     // Cleanup
     cudaFree(Gm_even_re);
