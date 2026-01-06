@@ -47,13 +47,14 @@ def compare_map2alm(nside, l_max, precision):
     print(f"\n=== Comparing map2alm: nside={nside}, l_max={l_max}, precision={precision} ===\n")
 
     n_rings = 4 * nside - 1
+    n_maps = 1  # Single map as array of size 1
 
-    # Create a random map
+    # Create a random map array [n_maps, n_rings, 4*nside]
     np.random.seed(42)
-    map_random = np.random.randn(1, n_rings, 4 * nside).astype(np_dtype)
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(np_dtype)
 
     # JAX result
-    map_jax = {0: jnp.array(map_random)}
+    map_jax = {0: jnp.array(map_array)}
     alm_jax_dict = jax_map2alm(nside, l_max, (0,), map_jax)
     alm_jax = np.array(alm_jax_dict[0][0])
 
@@ -73,7 +74,7 @@ def compare_map2alm(nside, l_max, precision):
         spht_cuda = SPHTCuda(nside, l_max, version='v6',
                             storage_precision=storage,
                             recurrence_precision=recurrence)
-        cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
+        cuda_result = spht_cuda.map2alm({0: map_array}, spins=(0,))
         alm_cuda = cuda_result[0][0]
 
         # Convert to same dtype for comparison
@@ -149,13 +150,14 @@ def compare_cell(nside, l_max, precision):
     print(f"\n=== Comparing C_ell: nside={nside}, l_max={l_max}, precision={precision} ===\n")
 
     n_rings = 4 * nside - 1
+    n_maps = 1  # Single map as array of size 1
 
-    # Create a random map
+    # Create a random map array [n_maps, n_rings, 4*nside]
     np.random.seed(42)
-    map_random = np.random.randn(1, n_rings, 4 * nside).astype(np_dtype)
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(np_dtype)
 
     # JAX alm and C_ell
-    map_jax = {0: jnp.array(map_random)}
+    map_jax = {0: jnp.array(map_array)}
     alm_jax_dict = jax_map2alm(nside, l_max, (0,), map_jax)
     alm_jax = np.array(alm_jax_dict[0][0])
     cell_jax = np.array(jax_alm2cl(l_max, jnp.array(alm_jax[None, :, :])))[0]
@@ -176,7 +178,7 @@ def compare_cell(nside, l_max, precision):
         spht_cuda = SPHTCuda(nside, l_max, version='v6',
                             storage_precision=storage,
                             recurrence_precision=recurrence)
-        cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
+        cuda_result = spht_cuda.map2alm({0: map_array}, spins=(0,))
         alm_cuda = cuda_result[0][0]
 
         # Compute C_ell

@@ -42,15 +42,16 @@ def benchmark_jax(nside, l_max, n_iterations, dtype_name):
     from SPHT_jax import map2alm as jax_map2alm
 
     n_rings = 4 * nside - 1
+    n_maps = 1  # Single map as array of size 1
 
-    # Create random map
+    # Create random map array [n_maps, n_rings, 4*nside]
     np.random.seed(42)
-    map_data = np.random.randn(1, n_rings, 4 * nside).astype(dtype)
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(dtype)
 
     if dtype_name == 'bfloat16':
-        map_jax = {0: jnp.array(map_data, dtype=jnp.bfloat16)}
+        map_jax = {0: jnp.array(map_array, dtype=jnp.bfloat16)}
     else:
-        map_jax = {0: jnp.array(map_data)}
+        map_jax = {0: jnp.array(map_array)}
 
     # Warmup
     _ = jax_map2alm(nside, l_max, (0,), map_jax)
@@ -69,13 +70,14 @@ def benchmark_jax(nside, l_max, n_iterations, dtype_name):
 
 
 def benchmark_cuda(nside, l_max, n_iterations, storage_precision='float64',
-                   recurrence_precision='float64', version='v5'):
+                   recurrence_precision='float64', version='v5', n_maps=1):
     """Benchmark CUDA map2alm with specified precision.
 
     Args:
         storage_precision: 'float64' or 'float32' for map/alm storage
         recurrence_precision: 'float64' or 'float32' for Ylm recurrence
-        version: CUDA implementation version ('v4', 'v5')
+        version: CUDA implementation version ('v4', 'v5', 'v6')
+        n_maps: Number of maps to process (array of maps)
     """
     spht_cuda = SPHTCuda(nside, l_max, version=version,
                          storage_precision=storage_precision,
@@ -83,19 +85,19 @@ def benchmark_cuda(nside, l_max, n_iterations, storage_precision='float64',
 
     n_rings = 4 * nside - 1
 
-    # Create random map with appropriate dtype
+    # Create random map array [n_maps, n_rings, 4*nside]
     np.random.seed(42)
     dtype = np.float32 if storage_precision == 'float32' else np.float64
-    map_data = np.random.randn(1, n_rings, 4 * nside).astype(dtype)
+    map_array = np.random.randn(n_maps, n_rings, 4 * nside).astype(dtype)
 
     # Warmup
-    _ = spht_cuda.map2alm({0: map_data}, spins=(0,))
+    _ = spht_cuda.map2alm({0: map_array}, spins=(0,))
 
     # Benchmark
     times = []
     for _ in range(n_iterations):
         start = time.perf_counter()
-        result = spht_cuda.map2alm({0: map_data}, spins=(0,))
+        result = spht_cuda.map2alm({0: map_array}, spins=(0,))
         end = time.perf_counter()
         times.append(end - start)
 

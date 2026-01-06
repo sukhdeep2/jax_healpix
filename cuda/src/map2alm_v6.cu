@@ -138,7 +138,7 @@ template<typename T, typename R>
 __global__ void compute_gm_kernel_v6(
     int nside, int l_max, int n_maps, int n_rings,
     const T* __restrict__ map_in,
-    R* __restrict__ Gm_even_re,   // [n_maps, n_north_rings, lp1]
+    R* __restrict__ Gm_even_re,   // [n_maps, lp1, n_north_rings] - optimized for coalesced reads
     R* __restrict__ Gm_even_im,
     R* __restrict__ Gm_odd_re,
     R* __restrict__ Gm_odd_im,
@@ -218,7 +218,8 @@ __global__ void compute_gm_kernel_v6(
             // Combine with N-S symmetry
             // Gm_even = Gm_n + Gm_s (for even l+m)
             // Gm_odd  = Gm_n - Gm_s (for odd l+m)
-            size_t idx = (size_t)t * n_north_rings * lp1 + north_ring * lp1 + m;
+            // Layout: [n_maps, lp1, n_north_rings] for coalesced reads in Phase 2
+            size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + north_ring;
             Gm_even_re[idx] = R(gn_re + gs_re);
             Gm_even_im[idx] = R(gn_im + gs_im);
             Gm_odd_re[idx]  = R(gn_re - gs_re);
@@ -228,17 +229,26 @@ __global__ void compute_gm_kernel_v6(
 }
 
 // ============================================================================
-// Phase 2: Reduce to alm using warp-per-m with ring batching
+// Phase 2: Reduce to alm using warp-per-m with ring batching and multi-map
 // One warp per m value, processes rings in batches to fit shared memory
+// Ylm is computed once and reused across all maps in parallel
 // ============================================================================
 
-// Ring batch size for v6 - 6 arrays * 256 * 8 bytes = 12KB, well under 48KB limit
+// Default ring batch size for v6 - can be reduced for multi-map
 #undef RING_BATCH_SIZE
 #define RING_BATCH_SIZE 256
+
+// Maximum maps that can be processed in parallel (shared memory limited)
+// Shared mem layout: geometry (2 arrays, shared) + Gm (4 arrays per map)
+// f64: 2*256*8 + N*4*256*8 <= 48KB -> N <= 5
+// f32: 2*256*4 + N*4*256*4 <= 48KB -> N <= 11
+#define MAX_PARALLEL_MAPS_F64 5
+#define MAX_PARALLEL_MAPS_F32 11
 
 template<typename T, typename R>
 __global__ void reduce_to_alm_kernel_v6(
     int nside, int l_max, int n_maps, int n_north_rings,
+    int ring_batch_size, int n_maps_parallel,  // configurable parameters
     const R* __restrict__ Gm_even_re,
     const R* __restrict__ Gm_even_im,
     const R* __restrict__ Gm_odd_re,
@@ -259,61 +269,73 @@ __global__ void reduce_to_alm_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
-    // Shared memory for current batch (6 arrays of RING_BATCH_SIZE)
+    // Shared memory layout:
+    // - Geometry (shared across maps): cos_theta, sin_theta [2 * ring_batch_size]
+    // - Gm per map: Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im [4 * ring_batch_size each]
     extern __shared__ char smem[];
-    R* sh_Gm_even_re = (R*)smem;
-    R* sh_Gm_even_im = sh_Gm_even_re + RING_BATCH_SIZE;
-    R* sh_Gm_odd_re  = sh_Gm_even_im + RING_BATCH_SIZE;
-    R* sh_Gm_odd_im  = sh_Gm_odd_re + RING_BATCH_SIZE;
-    R* sh_cos_th     = sh_Gm_odd_im + RING_BATCH_SIZE;
-    R* sh_sin_th     = sh_cos_th + RING_BATCH_SIZE;
+    R* sh_cos_th = (R*)smem;
+    R* sh_sin_th = sh_cos_th + ring_batch_size;
+    // Gm arrays for parallel maps (4 arrays per map)
+    R* sh_Gm_base = sh_sin_th + ring_batch_size;
 
     // Per-lane Ylm recurrence state (local memory, L1 cached)
     C Ylm_prev1[MAX_RINGS_PER_LANE];
     C Ylm_prev2[MAX_RINGS_PER_LANE];
 
-    // Process each map
-    for (int t = 0; t < n_maps; t++) {
-        size_t base_idx = (size_t)t * n_north_rings * lp1;
+    // Per-lane accumulators for each parallel map
+    // We'll process maps in groups of n_maps_parallel
+    C sum_re[MAX_PARALLEL_MAPS_F32];  // Use max possible for static allocation
+    C sum_im[MAX_PARALLEL_MAPS_F32];
 
-        // Output pointer for this map
-        T* alm_re_t = alm_out_re + (size_t)t * lp1 * lp1;
-        T* alm_im_t = alm_out_im + (size_t)t * lp1 * lp1;
+    // Process maps in batches of n_maps_parallel
+    for (int map_batch_start = 0; map_batch_start < n_maps; map_batch_start += n_maps_parallel) {
+        int map_batch_end = min(map_batch_start + n_maps_parallel, n_maps);
+        int n_maps_in_batch = map_batch_end - map_batch_start;
 
         // Process ring batches
-        for (int batch_start = 0; batch_start < n_north_rings; batch_start += RING_BATCH_SIZE) {
-            int batch_end = min(batch_start + RING_BATCH_SIZE, n_north_rings);
+        for (int batch_start = 0; batch_start < n_north_rings; batch_start += ring_batch_size) {
+            int batch_end = min(batch_start + ring_batch_size, n_north_rings);
             int batch_size = batch_end - batch_start;
 
-            // Cooperative load of Gm and geometry for this batch
+            // Cooperative load of geometry (shared across all maps)
             for (int r = lane; r < batch_size; r += 32) {
                 int global_r = batch_start + r;
-                size_t idx = base_idx + global_r * lp1 + m;
-                sh_Gm_even_re[r] = Gm_even_re[idx];
-                sh_Gm_even_im[r] = Gm_even_im[idx];
-                sh_Gm_odd_re[r]  = Gm_odd_re[idx];
-                sh_Gm_odd_im[r]  = Gm_odd_im[idx];
                 sh_cos_th[r] = cos_theta[global_r];
                 sh_sin_th[r] = sin_theta[global_r];
+            }
+
+            // Cooperative load of Gm for all maps in this batch
+            // Gm layout: [n_maps, lp1, n_north_rings] - consecutive rings are consecutive in memory
+            for (int t = 0; t < n_maps_in_batch; t++) {
+                int global_t = map_batch_start + t;
+                // Base index for this map and m value
+                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
+                R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;  // 4 Gm arrays per map
+
+                for (int r = lane; r < batch_size; r += 32) {
+                    int global_r = batch_start + r;
+                    // Now consecutive threads access consecutive memory (coalesced!)
+                    size_t idx = base_idx + global_r;
+                    sh_Gm_t[0 * ring_batch_size + r] = Gm_even_re[idx];
+                    sh_Gm_t[1 * ring_batch_size + r] = Gm_even_im[idx];
+                    sh_Gm_t[2 * ring_batch_size + r] = Gm_odd_re[idx];
+                    sh_Gm_t[3 * ring_batch_size + r] = Gm_odd_im[idx];
+                }
             }
             __syncwarp();
 
             // Determine which rings this lane handles in this batch
-            // Lane handles global rings: lane, lane+32, lane+64, ...
-            // Find first k such that lane + 32*k >= batch_start
             int k_start = (batch_start > lane) ? (batch_start - lane + 31) / 32 : 0;
-            // Find last k such that lane + 32*k < batch_end
             int k_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
             int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
             k_end = min(k_end, n_my_rings_total);
 
-            // Initialize Y[m,m] for rings in this batch (only on first l iteration)
+            // Initialize Y[m,m] for rings in this batch
             for (int k = k_start; k < k_end; k++) {
                 int global_r = lane + 32 * k;
                 int local_r = global_r - batch_start;
                 C sin_th = C(sh_sin_th[local_r]);
 
-                // Y[m,m] = (-1)^m * sin^m(θ) * sqrt((2m+1)!!/(2m)!!) / sqrt(4π)
                 C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
                 for (int j = 1; j <= m; j++) {
                     Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
@@ -324,15 +346,22 @@ __global__ void reduce_to_alm_kernel_v6(
             }
 
             // Process l = m to l_max for this batch
+            // Ylm computed once, reused for all maps in parallel
             for (int l = m; l <= l_max; l++) {
-                C sum_re = C(0), sum_im = C(0);
+                // Reset accumulators for all maps
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    sum_re[t] = C(0);
+                    sum_im[t] = C(0);
+                }
 
+                // Accumulate across rings (Ylm computed once)
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
                     int local_r = global_r - batch_start;
                     C cos_th = C(sh_cos_th[local_r]);
                     C Ylm;
 
+                    // Compute Ylm (same for all maps)
                     if (l == m) {
                         Ylm = Ylm_prev1[k];
                     } else if (l == m + 1) {
@@ -352,35 +381,46 @@ __global__ void reduce_to_alm_kernel_v6(
                         Ylm_prev1[k] = Ylm;
                     }
 
-                    // Select Gm based on (l+m) parity
-                    C gm_re, gm_im;
-                    if ((l + m) & 1) {
-                        gm_re = C(sh_Gm_odd_re[local_r]);
-                        gm_im = C(sh_Gm_odd_im[local_r]);
-                    } else {
-                        gm_re = C(sh_Gm_even_re[local_r]);
-                        gm_im = C(sh_Gm_even_im[local_r]);
+                    // Accumulate Ylm * Gm for each map (reuse Ylm)
+                    int parity = (l + m) & 1;
+                    for (int t = 0; t < n_maps_in_batch; t++) {
+                        R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
+                        C gm_re, gm_im;
+                        if (parity) {
+                            gm_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);  // odd_re
+                            gm_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);  // odd_im
+                        } else {
+                            gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);  // even_re
+                            gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);  // even_im
+                        }
+                        sum_re[t] += Ylm * gm_re;
+                        sum_im[t] += Ylm * gm_im;
+                    }
+                }
+
+                // Warp-level reduction and output for each map
+                for (int t = 0; t < n_maps_in_batch; t++) {
+                    C sr = sum_re[t];
+                    C si = sum_im[t];
+
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2) {
+                        sr += __shfl_down_sync(0xffffffff, sr, offset);
+                        si += __shfl_down_sync(0xffffffff, si, offset);
                     }
 
-                    sum_re += Ylm * gm_re;
-                    sum_im += Ylm * gm_im;
-                }
+                    if (lane == 0) {
+                        int global_t = map_batch_start + t;
+                        T* alm_re_t = alm_out_re + (size_t)global_t * lp1 * lp1;
+                        T* alm_im_t = alm_out_im + (size_t)global_t * lp1 * lp1;
 
-                // Warp-level reduction
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    sum_re += __shfl_down_sync(0xffffffff, sum_re, offset);
-                    sum_im += __shfl_down_sync(0xffffffff, sum_im, offset);
-                }
-
-                // Lane 0 accumulates (first batch writes, subsequent batches add)
-                if (lane == 0) {
-                    if (batch_start == 0) {
-                        alm_re_t[l * lp1 + m] = T(sum_re * C(pix_area));
-                        alm_im_t[l * lp1 + m] = T(sum_im * C(pix_area));
-                    } else {
-                        alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sum_re * C(pix_area));
-                        alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + sum_im * C(pix_area));
+                        if (batch_start == 0) {
+                            alm_re_t[l * lp1 + m] = T(sr * C(pix_area));
+                            alm_im_t[l * lp1 + m] = T(si * C(pix_area));
+                        } else {
+                            alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sr * C(pix_area));
+                            alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + si * C(pix_area));
+                        }
                     }
                 }
             }
@@ -391,6 +431,46 @@ __global__ void reduce_to_alm_kernel_v6(
 // ============================================================================
 // Host wrapper implementation
 // ============================================================================
+
+// Helper function to compute optimal ring batch size and parallel maps
+template<typename R>
+void compute_v6_params(int n_maps, int* ring_batch_size, int* n_maps_parallel) {
+    // Available shared memory (48KB)
+    const size_t MAX_SMEM = 48 * 1024;
+    const size_t elem_size = sizeof(R);
+
+    // Default batch size
+    int batch = RING_BATCH_SIZE;  // 256
+
+    // Calculate max parallel maps for default batch size
+    // Shared mem: geometry (2 arrays) + Gm (4 arrays per map)
+    // smem = 2 * batch * elem + n_par * 4 * batch * elem
+    // n_par = (MAX_SMEM / elem - 2 * batch) / (4 * batch)
+    int max_parallel = (MAX_SMEM / elem_size - 2 * batch) / (4 * batch);
+
+    // Cap at compile-time maximum
+    if (std::is_same<R, float>::value) {
+        max_parallel = min(max_parallel, MAX_PARALLEL_MAPS_F32);
+    } else {
+        max_parallel = min(max_parallel, MAX_PARALLEL_MAPS_F64);
+    }
+    max_parallel = max(1, max_parallel);
+
+    // If n_maps <= max_parallel, use default batch and process all maps together
+    if (n_maps <= max_parallel) {
+        *ring_batch_size = batch;
+        *n_maps_parallel = n_maps;
+        return;
+    }
+
+    // Otherwise, try to balance batch size vs parallel maps
+    // Option 1: Use default batch, process maps in groups of max_parallel
+    // Option 2: Reduce batch size to fit more maps in parallel
+
+    // For now, use default batch and let the kernel handle map batching
+    *ring_batch_size = batch;
+    *n_maps_parallel = max_parallel;
+}
 
 template<typename T, typename R>
 void map2alm_cuda_v6_impl(
@@ -433,15 +513,20 @@ void map2alm_cuda_v6_impl(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Phase 2: Reduce to alm with ring batching
-    // Shared memory: 6 arrays of RING_BATCH_SIZE elements
-    size_t smem_size = 6 * RING_BATCH_SIZE * sizeof(R);
+    // Compute optimal ring batch size and parallel maps
+    int ring_batch_size, n_maps_parallel;
+    compute_v6_params<R>(n_maps, &ring_batch_size, &n_maps_parallel);
+
+    // Phase 2: Reduce to alm with ring batching and multi-map
+    // Shared memory: geometry (2 arrays) + Gm per map (4 arrays each)
+    size_t smem_size = (2 + 4 * n_maps_parallel) * ring_batch_size * sizeof(R);
 
     R pix_area = R(4.0 * M_PI / (12.0 * nside * nside));
 
     // One block per m, 32 threads (one warp)
     reduce_to_alm_kernel_v6<T, R><<<lp1, 32, smem_size>>>(
         nside, l_max, n_maps, n_north_rings,
+        ring_batch_size, n_maps_parallel,
         Gm_even_re, Gm_even_im, Gm_odd_re, Gm_odd_im,
         cos_theta, sin_theta, pix_area,
         alm_out_re, alm_out_im
