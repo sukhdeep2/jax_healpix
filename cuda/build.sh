@@ -62,8 +62,13 @@ SOURCES=(
     "ring_integrate.cu"
     "alm2map.cu"
     "map2alm.cu"
-    "map2alm_v2.cu"    # NEW: Optimized version
-    "fft_gm.cu"        # NEW: FFT-based Gm
+    "map2alm_v2.cu"    # FFT + cuBLAS version
+    "map2alm_v3.cu"    # Fused per-ring parallel version
+    "map2alm_v4.cu"    # Tiled version for large nside
+    "map2alm_v5.cu"    # Multi-precision templated version
+    "map2alm_v6.cu"    # Optimal warp-per-m, NO atomics
+    "alm2map_v5.cu"    # Multi-precision synthesis version
+    "fft_gm.cu"        # FFT-based Gm
     "spht_api.cu"
 )
 

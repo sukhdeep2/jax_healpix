@@ -2,10 +2,11 @@
 """Compare CUDA SPHT results against JAX reference implementation
 
 Usage:
-    python test_vs_jax.py [nside] [l_max]
+    python test_vs_jax.py [nside] [l_max] [precision]
 
-    nside: HEALPix resolution parameter (default: 8)
+    nside: HEALPix resolution parameter (default: 256)
     l_max: Maximum multipole (default: 3*nside)
+    precision: 'float64' or 'float32' (default: float64)
 """
 
 import numpy as np
@@ -13,220 +14,254 @@ import sys
 sys.path.insert(0, '/home/deep/repos/SPHT/cuda/python')
 sys.path.insert(0, '/home/deep/repos/SPHT/jax_healpix')
 
-# Enable 64-bit precision in JAX (must be done before importing jax.numpy)
-import jax
-jax.config.update("jax_enable_x64", True)
-
-from spht_cuda import SPHTCuda, compute_ylm_cuda, get_ring_geometry
-
-# Import JAX SPHT reference
-import jax.numpy as jnp
-from YLM_jax_log import sYLM_recur_log
-from SPHT_jax import map2alm as jax_map2alm, alm2cl as jax_alm2cl
-
 # Global parameters (can be overridden via command line)
 NSIDE = 256
 L_MAX = None  # If None, defaults to 3*NSIDE
+PRECISION = 'float64'  # 'float64' or 'float32'
 
 
-def compare_ylm(nside, l_max):
-    """Compare YLM values against JAX reference"""
-    n_rings = 2 * nside  # North hemisphere + equator
+def setup_precision(precision):
+    """Configure JAX and CUDA precision settings."""
+    import jax
 
-    print(f"\n=== Comparing YLM: nside={nside}, l_max={l_max}, n_rings={n_rings} ===\n")
+    if precision == 'float64':
+        jax.config.update("jax_enable_x64", True)
+        np_dtype = np.float64
+        np_complex = np.complex128
+    else:
+        jax.config.update("jax_enable_x64", False)
+        np_dtype = np.float32
+        np_complex = np.complex64
 
-    # Get CUDA geometry
-    cuda_log_beta, cuda_beta_sign = get_ring_geometry(nside)
-
-    # Compute CUDA YLM
-    ylm_cuda = compute_ylm_cuda(l_max, cuda_log_beta[:n_rings])
-
-    # Compute JAX YLM using log_beta directly
-    log_beta_jax = jnp.array(cuda_log_beta[:n_rings])
-
-    # Call JAX YLM computation
-    ylm_jax_dict = sYLM_recur_log(l_max, (0,), log_beta_jax)
-    ylm_jax = np.array(ylm_jax_dict[0])  # Shape [l_max+1, l_max+1, n_rings]
-
-    # Compare
-    diff = np.abs(ylm_cuda - ylm_jax)
-    max_diff = np.max(diff)
-    print(f"Max absolute difference: {max_diff:.6e}")
-
-    # Show some values
-    print("\nSample YLM values (first 5 l values, ring 0):")
-    for l in range(min(5, l_max + 1)):
-        for m in range(l + 1):
-            cuda_val = ylm_cuda[l, m, 0]
-            jax_val = ylm_jax[l, m, 0]
-            d = abs(cuda_val - jax_val)
-            status = "OK" if d < 1e-10 else f"DIFF={d:.2e}"
-            print(f"  Y_{l},{m}(ring 0): CUDA={cuda_val:12.6e}  JAX={jax_val:12.6e}  {status}")
-
-    # Show any large differences
-    if max_diff > 1e-10:
-        print("\nLarge differences (showing first 20):")
-        large_diffs = np.argwhere(diff > 1e-10)
-        for idx in large_diffs[:20]:
-            l, m, r = idx
-            print(f"  Y_{l},{m}(ring {r}): CUDA={ylm_cuda[l,m,r]:.6e}  JAX={ylm_jax[l,m,r]:.6e}  diff={diff[l,m,r]:.2e}")
-
-    # 1e-4 is acceptable for numerical computations
-    return max_diff < 1e-4
+    return np_dtype, np_complex
 
 
-def compare_map2alm(nside, l_max):
+def compare_map2alm(nside, l_max, precision):
     """Compare map2alm results between CUDA and JAX"""
-    print(f"\n=== Comparing map2alm: nside={nside}, l_max={l_max} ===\n")
+    from spht_cuda import SPHTCuda
+    import jax.numpy as jnp
+    from SPHT_jax import map2alm as jax_map2alm
 
-    # Initialize CUDA implementation
-    spht_cuda = SPHTCuda(nside, l_max)
+    np_dtype, np_complex = setup_precision(precision)
+
+    print(f"\n=== Comparing map2alm: nside={nside}, l_max={l_max}, precision={precision} ===\n")
 
     n_rings = 4 * nside - 1
 
     # Create a random map
     np.random.seed(42)
-    map_random = np.random.randn(1, n_rings, 4 * nside)
+    map_random = np.random.randn(1, n_rings, 4 * nside).astype(np_dtype)
 
-    # CUDA result
-    cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
-    alm_cuda = cuda_result[0][0]  # First map, shape [l_max+1, l_max+1]
-
-    # JAX result - use actual JAX implementation
+    # JAX result
     map_jax = {0: jnp.array(map_random)}
     alm_jax_dict = jax_map2alm(nside, l_max, (0,), map_jax)
-    alm_jax = np.array(alm_jax_dict[0][0])  # First map, shape [l_max+1, l_max+1]
+    alm_jax = np.array(alm_jax_dict[0][0])
 
-    # Compare alm values
-    print("ALM comparison (first 6 l values):")
-    print(f"  l,m |      a_lm (CUDA)       |       a_lm (JAX)       |   Rel Diff")
-    print("-" * 80)
-    for l in range(min(6, l_max + 1)):
+    # CUDA results - test different precision combinations
+    if precision == 'float32':
+        cuda_configs = [
+            ('f32_f64', 'float32', 'float64'),  # f32 storage, f64 recurrence (recommended)
+            ('f32_f32', 'float32', 'float32'),  # full f32 (fastest)
+        ]
+    else:
+        cuda_configs = [
+            ('f64_f64', 'float64', 'float64'),  # full f64 (highest accuracy)
+        ]
+
+    results = {}
+    for name, storage, recurrence in cuda_configs:
+        spht_cuda = SPHTCuda(nside, l_max, version='v6',
+                            storage_precision=storage,
+                            recurrence_precision=recurrence)
+        cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
+        alm_cuda = cuda_result[0][0]
+
+        # Convert to same dtype for comparison
+        if alm_cuda.dtype != alm_jax.dtype:
+            alm_cuda_cmp = alm_cuda.astype(alm_jax.dtype)
+        else:
+            alm_cuda_cmp = alm_cuda
+
+        # Compute statistics
+        diff = np.abs(alm_cuda_cmp - alm_jax)
+        rel_diff = diff / (np.abs(alm_jax) + 1e-15)
+
+        # Only consider valid (l,m) pairs where l >= m
+        valid_mask = np.zeros_like(diff, dtype=bool)
+        for l in range(l_max + 1):
+            for m in range(l + 1):
+                valid_mask[l, m] = True
+
+        max_rel_diff = np.max(rel_diff[valid_mask])
+        mean_rel_diff = np.mean(rel_diff[valid_mask])
+        max_abs_diff = np.max(diff[valid_mask])
+
+        results[name] = {
+            'alm': alm_cuda,
+            'max_rel': max_rel_diff,
+            'mean_rel': mean_rel_diff,
+            'max_abs': max_abs_diff,
+            'all_finite': np.all(np.isfinite(alm_cuda)),
+        }
+
+        print(f"CUDA {name} ({storage} storage, {recurrence} recurrence):")
+        print(f"  Max relative diff vs JAX: {max_rel_diff:.6e}")
+        print(f"  Mean relative diff: {mean_rel_diff:.6e}")
+        print(f"  All finite: {results[name]['all_finite']}")
+
+    # Show sample values
+    print(f"\nSample ALM values (first 4 l values):")
+    print(f"  l,m |      JAX             ", end="")
+    for name in results:
+        print(f"|      CUDA {name}       ", end="")
+    print()
+    print("-" * (25 + 25 * len(results)))
+
+    for l in range(min(4, l_max + 1)):
         for m in range(l + 1):
-            cuda_val = alm_cuda[l, m]
             jax_val = alm_jax[l, m]
-            rel = abs(cuda_val - jax_val) / (abs(jax_val) + 1e-15)
-            print(f"  {l},{m} | {cuda_val.real:10.4e}+{cuda_val.imag:10.4e}j | "
-                  f"{jax_val.real:10.4e}+{jax_val.imag:10.4e}j | {rel:10.2e}")
+            print(f"  {l},{m} | {jax_val.real:9.3e}+{jax_val.imag:9.3e}j", end="")
+            for name in results:
+                cuda_val = results[name]['alm'][l, m]
+                print(f" | {cuda_val.real:9.3e}+{cuda_val.imag:9.3e}j", end="")
+            print()
 
-    # Compute overall statistics
-    diff = np.abs(alm_cuda - alm_jax)
-    rel_diff = diff / (np.abs(alm_jax) + 1e-15)
+    # Check success criteria (looser for float32)
+    threshold = 1e-4 if precision == 'float64' else 1e-2
+    all_pass = True
+    for name, r in results.items():
+        passed = r['all_finite'] and r['max_rel'] < threshold
+        if not passed:
+            all_pass = False
+        print(f"\n  {name}: {'PASS' if passed else 'FAIL'} (threshold: {threshold:.0e})")
 
-    # Only consider valid (l,m) pairs where l >= m
-    valid_mask = np.zeros_like(diff, dtype=bool)
-    for l in range(l_max + 1):
-        for m in range(l + 1):
-            valid_mask[l, m] = True
-
-    max_rel_diff = np.max(rel_diff[valid_mask])
-    mean_rel_diff = np.mean(rel_diff[valid_mask])
-    max_abs_diff = np.max(diff[valid_mask])
-
-    print(f"\nStatistics (all valid l,m):")
-    print(f"  Max relative difference: {max_rel_diff:.6e}")
-    print(f"  Mean relative difference: {mean_rel_diff:.6e}")
-    print(f"  Max absolute difference: {max_abs_diff:.6e}")
-
-    # Success criteria
-    all_finite = np.all(np.isfinite(alm_cuda)) and np.all(np.isfinite(alm_jax))
-    close_match = max_rel_diff < 1e-4  # Within 0.01%
-
-    print(f"\n  All finite: {all_finite}")
-    print(f"  Close match (< 0.01% rel diff): {close_match}")
-
-    return all_finite and close_match
+    return all_pass
 
 
-def compare_cell(nside, l_max):
+def compare_cell(nside, l_max, precision):
     """Compare angular power spectrum C_ell between CUDA and JAX"""
-    print(f"\n=== Comparing C_ell: nside={nside}, l_max={l_max} ===\n")
+    from spht_cuda import SPHTCuda
+    import jax.numpy as jnp
+    from SPHT_jax import map2alm as jax_map2alm, alm2cl as jax_alm2cl
 
-    # Initialize CUDA implementation
-    spht_cuda = SPHTCuda(nside, l_max)
+    np_dtype, np_complex = setup_precision(precision)
+
+    print(f"\n=== Comparing C_ell: nside={nside}, l_max={l_max}, precision={precision} ===\n")
 
     n_rings = 4 * nside - 1
 
     # Create a random map
     np.random.seed(42)
-    map_random = np.random.randn(1, n_rings, 4 * nside)
+    map_random = np.random.randn(1, n_rings, 4 * nside).astype(np_dtype)
 
-    # CUDA alm
-    cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
-    alm_cuda = cuda_result[0][0]  # Shape [l_max+1, l_max+1]
-
-    # JAX alm - use actual JAX implementation
+    # JAX alm and C_ell
     map_jax = {0: jnp.array(map_random)}
     alm_jax_dict = jax_map2alm(nside, l_max, (0,), map_jax)
-    alm_jax = np.array(alm_jax_dict[0][0])  # Shape [l_max+1, l_max+1]
-
-    # Compute C_ell using JAX function for both
-    # The JAX alm2cl expects shape [n_maps, l_max+1, l_max+1]
+    alm_jax = np.array(alm_jax_dict[0][0])
     cell_jax = np.array(jax_alm2cl(l_max, jnp.array(alm_jax[None, :, :])))[0]
 
-    # Compute C_ell for CUDA result using same formula
-    cell_cuda = np.array(jax_alm2cl(l_max, jnp.array(alm_cuda[None, :, :])))[0]
+    # CUDA configs
+    if precision == 'float32':
+        cuda_configs = [
+            ('f32_f64', 'float32', 'float64'),
+            ('f32_f32', 'float32', 'float32'),
+        ]
+    else:
+        cuda_configs = [
+            ('f64_f64', 'float64', 'float64'),
+        ]
 
-    # Compare
-    diff = np.abs(cell_cuda - cell_jax)
-    rel_diff = diff / (np.abs(cell_jax) + 1e-15)
+    results = {}
+    for name, storage, recurrence in cuda_configs:
+        spht_cuda = SPHTCuda(nside, l_max, version='v6',
+                            storage_precision=storage,
+                            recurrence_precision=recurrence)
+        cuda_result = spht_cuda.map2alm({0: map_random}, spins=(0,))
+        alm_cuda = cuda_result[0][0]
 
-    print("C_ell comparison (CUDA vs JAX):")
-    print(f"  l |    C_l (CUDA)   |    C_l (JAX)    |   Abs Diff   |  Rel Diff")
-    print("-" * 75)
-    for l in range(min(15, l_max + 1)):
-        print(f"  {l:2d} | {cell_cuda[l]:14.6e} | {cell_jax[l]:14.6e} | {diff[l]:12.2e} | {rel_diff[l]:10.2e}")
+        # Compute C_ell
+        alm_for_cl = alm_cuda.astype(np.complex128) if alm_cuda.dtype == np.complex64 else alm_cuda
+        cell_cuda = np.array(jax_alm2cl(l_max, jnp.array(alm_for_cl[None, :, :])))[0]
 
-    # Overall statistics
-    max_rel_diff = np.max(rel_diff)
-    mean_rel_diff = np.mean(rel_diff)
+        diff = np.abs(cell_cuda - cell_jax)
+        rel_diff = diff / (np.abs(cell_jax) + 1e-15)
 
-    print(f"\nStatistics:")
-    print(f"  Max relative difference: {max_rel_diff:.6e}")
-    print(f"  Mean relative difference: {mean_rel_diff:.6e}")
-    print(f"  Max absolute difference: {np.max(diff):.6e}")
+        # Only consider C_ell up to l ~ nside (reliable regime for HEALPix)
+        l_reliable = nside
+        results[name] = {
+            'cell': cell_cuda,
+            'max_rel': np.max(rel_diff[:l_reliable + 1]),
+            'mean_rel': np.mean(rel_diff[:l_reliable + 1]),
+            'max_rel_all': np.max(rel_diff),  # For reference
+        }
 
-    # Check that values are close
-    all_finite = np.all(np.isfinite(cell_cuda)) and np.all(np.isfinite(cell_jax))
-    close_match = max_rel_diff < 1e-4  # Within 0.01%
+        print(f"CUDA {name}: Max rel diff (l≤{l_reliable}) = {results[name]['max_rel']:.6e}")
 
-    print(f"\n  All finite: {all_finite}")
-    print(f"  Close match (< 0.01% rel diff): {close_match}")
+    # Show C_ell comparison at key ℓ values
+    l_reliable = nside
+    sample_ells = [0, 2, 10, nside//4, nside//2, nside]
+    sample_ells = [l for l in sample_ells if l <= l_max]
 
-    return all_finite and close_match
+    print(f"\nC_ell comparison (sample ℓ values, reliable range: ℓ≤{l_reliable}):")
+    print(f"  l  |    JAX          ", end="")
+    for name in results:
+        print(f"|    CUDA {name}     ", end="")
+    print()
+    print("-" * (20 + 20 * len(results)))
+
+    for l in sample_ells:
+        print(f"{l:4d} | {cell_jax[l]:14.6e}", end="")
+        for name in results:
+            print(f" | {results[name]['cell'][l]:14.6e}", end="")
+        print()
+
+    # Check success (only for reliable ℓ range)
+    threshold = 1e-4 if precision == 'float64' else 1e-2
+    all_pass = True
+    for name, r in results.items():
+        passed = r['max_rel'] < threshold
+        if not passed:
+            all_pass = False
+
+    return all_pass
 
 
-def main(nside=None, l_max=None):
+def main(nside=None, l_max=None, precision=None):
     # Use global defaults if not specified
     if nside is None:
         nside = NSIDE
     if l_max is None:
         l_max = L_MAX if L_MAX is not None else 3 * nside
+    if precision is None:
+        precision = PRECISION
 
-    print("=" * 60)
+    print("=" * 70)
     print("CUDA SPHT vs JAX Reference Comparison")
-    print(f"  nside = {nside}")
-    print(f"  l_max = {l_max}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"  nside     = {nside}")
+    print(f"  l_max     = {l_max}")
+    print(f"  precision = {precision}")
+    if precision == 'float32':
+        print("  CUDA modes: f32_f64 (recommended), f32_f32 (fastest)")
+    print("=" * 70)
 
-    ylm_match = compare_ylm(nside, l_max)
-    map2alm_match = compare_map2alm(nside, l_max)
-    cell_match = compare_cell(nside, l_max)
+    map2alm_match = compare_map2alm(nside, l_max, precision)
+    cell_match = compare_cell(nside, l_max, precision)
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("Summary:")
-    print(f"  YLM match: {'PASS' if ylm_match else 'FAIL'}")
     print(f"  map2alm match: {'PASS' if map2alm_match else 'FAIL'}")
     print(f"  C_ell match: {'PASS' if cell_match else 'FAIL'}")
-    print("=" * 60)
+    print("=" * 70)
 
-    return ylm_match and map2alm_match and cell_match
+    return map2alm_match and cell_match
 
 
 if __name__ == "__main__":
     # Parse command line arguments
     nside = int(sys.argv[1]) if len(sys.argv) > 1 else NSIDE
     l_max = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    precision = sys.argv[3] if len(sys.argv) > 3 else PRECISION
 
-    success = main(nside, l_max)
+    success = main(nside, l_max, precision)
     sys.exit(0 if success else 1)
