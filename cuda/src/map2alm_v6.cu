@@ -1205,6 +1205,19 @@ __global__ void reduce_to_alm_kernel_v6(
                     sum_im[t] = C(0);
                 }
 
+                // Precompute l-dependent recurrence coefficients (outside ring loop)
+                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                if (l == m + 1) {
+                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                } else if (l > m + 1) {
+                    C l2 = C(l * l);
+                    C m2 = C(m * m);
+                    C lm1_2 = C((l-1) * (l-1));
+                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
+                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                }
+                int parity = (l + m) & 1;
+
                 // Accumulate across rings (Ylm computed once)
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
@@ -1216,24 +1229,16 @@ __global__ void reduce_to_alm_kernel_v6(
                     if (l == m) {
                         Ylm = Ylm_prev1[k];
                     } else if (l == m + 1) {
-                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_prev1[k];
+                        Ylm = cos_th * recur_C * Ylm_prev1[k];
                         Ylm_prev2[k] = Ylm_prev1[k];
                         Ylm_prev1[k] = Ylm;
                     } else {
-                        C l2 = C(l * l);
-                        C m2 = C(m * m);
-                        C lm1_2 = C((l-1) * (l-1));
-
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
-
-                        Ylm = A * cos_th * Ylm_prev1[k] - B * Ylm_prev2[k];
+                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
                         Ylm_prev2[k] = Ylm_prev1[k];
                         Ylm_prev1[k] = Ylm;
                     }
 
                     // Accumulate Ylm * Gm for each map (reuse Ylm)
-                    int parity = (l + m) & 1;
                     for (int t = 0; t < n_maps_in_batch; t++) {
                         R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
                         C gm_re, gm_im;
@@ -2039,12 +2044,32 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                     sum_B_im[t] = C(0);
                 }
 
-                // Spin-2 coefficients for this l
+                // Precompute all l-dependent coefficients (outside ring loop)
+                // NOTE: norm = 1/sqrt((l-1)*l*(l+1)*(l+2)) is deferred to output stage
                 C norm = compute_spin2_norm<C>(l);
                 C alpha = compute_alpha_lm<C>(l, m);
                 C alpha_prev = (l > 1) ? compute_alpha_lm<C>(l-1, m) : C(0);
                 C m2 = C(m * m);
                 C ll1 = C(l * (l - 1));
+                C two_alpha = C(2) * alpha;
+                C two_m = C(2) * C(m);
+                C lm1 = C(l - 1);
+                C two_m2_minus_l = C(2) * (m2 - C(l));
+
+                // Parity for N-S combination (l-dependent)
+                int parity_s0 = (l + m) & 1;  // spin-0 parity (for ₂Y)
+                int parity_m2 = (l + m + 1) & 1;  // ₋₂Y has extra sign flip
+
+                // Recurrence coefficients for Ylm (l-dependent)
+                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                if (l == m + 1) {
+                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                } else if (l > m + 1) {
+                    C l2 = C(l * l);
+                    C lm1_2 = C((l-1) * (l-1));
+                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
+                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                }
 
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
@@ -2060,42 +2085,31 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                         Ylm = Ylm_prev1[k];
                         Ylm_prev = C(0);
                     } else if (l == m + 1) {
-                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_prev1[k];
+                        Ylm = cos_th * recur_C * Ylm_prev1[k];
                         Ylm_prev = Ylm_prev1[k];
                         Ylm_prev2[k] = Ylm_prev1[k];
                         Ylm_prev1[k] = Ylm;
                     } else {
-                        C l2 = C(l * l);
-                        C lm1_2 = C((l-1) * (l-1));
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
-                        Ylm = A * cos_th * Ylm_prev1[k] - B * Ylm_prev2[k];
+                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
                         Ylm_prev = Ylm_prev1[k];
                         Ylm_prev2[k] = Ylm_prev1[k];
                         Ylm_prev1[k] = Ylm;
                     }
 
-                    // Compute spin-2 harmonics from spin-0
-                    // ₂Y = norm * [(2(m²-l)/sin² - l(l-1)) * Y + 2*alpha*cos/sin² * Y_{l-1}]
-                    C coeff1 = (C(2) * (m2 - C(l)) * inv_sin_sq - ll1);
-                    C coeff2 = C(2) * alpha * cos_th * inv_sin_sq;
-                    C Y2 = norm * (coeff1 * Ylm + coeff2 * Ylm_prev);
+                    // === Phase 1: Compute ₂Y (unnormalized), accumulate, free ===
+                    // ₂Y_unnorm = (2(m²-l)/sin² - l(l-1)) × Y + 2×alpha×cos/sin² × Y_{l-1}
+                    C coeff1 = two_m2_minus_l * inv_sin_sq - ll1;
+                    C coeff2 = two_alpha * cos_th * inv_sin_sq;
+                    C Y2 = coeff1 * Ylm + coeff2 * Ylm_prev;
 
-                    // ₋₂Y = norm * [2m/sin² * (alpha * Y_{l-1} - (l-1)*cos * Y)]
-                    C inner = alpha * Ylm_prev - C(l - 1) * cos_th * Ylm;
-                    C Ym2 = norm * C(2) * C(m) * inv_sin_sq * inner;
-
-                    // Parity for N-S combination
-                    int parity_s0 = (l + m) & 1;  // spin-0 parity
-                    int parity_m2 = (l + m + 1) & 1;  // -2 spin has extra sign flip for south
-
-                    // Accumulate for each map
+                    // Accumulate Y2 contributions for each map
+                    // Y2 uses parity_s0 for both Q (in E) and U (in B)
                     for (int t = 0; t < n_maps_in_batch; t++) {
                         R* sh_Gm_t = sh_Gm_base + t * 8 * ring_batch_size;
 
-                        // Get Q and U Gm values based on parity
-                        C gm_Q_re, gm_Q_im, gm_U_re, gm_U_im;
-                        if (parity_s0) {  // odd parity for Q (using spin-0 parity for Y2)
+                        // Get Q Gm (parity_s0) for E equation
+                        C gm_Q_re, gm_Q_im;
+                        if (parity_s0) {
                             gm_Q_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
                             gm_Q_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
                         } else {
@@ -2103,7 +2117,38 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                             gm_Q_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
                         }
 
-                        // For U with -2 spin, use parity_m2
+                        // Get U Gm (parity_s0) for B equation
+                        C gm_U_re, gm_U_im;
+                        if (parity_s0) {
+                            gm_U_re = C(sh_Gm_t[6 * ring_batch_size + local_r]);
+                            gm_U_im = C(sh_Gm_t[7 * ring_batch_size + local_r]);
+                        } else {
+                            gm_U_re = C(sh_Gm_t[4 * ring_batch_size + local_r]);
+                            gm_U_im = C(sh_Gm_t[5 * ring_batch_size + local_r]);
+                        }
+
+                        // E: ₂Y × Q contribution
+                        sum_E_re[t] += Y2 * gm_Q_re;
+                        sum_E_im[t] += Y2 * gm_Q_im;
+
+                        // B: ₂Y × (i×U) contribution → -U_im, +U_re
+                        sum_B_re[t] -= Y2 * gm_U_im;
+                        sum_B_im[t] += Y2 * gm_U_re;
+                    }
+                    // Y2 no longer needed, register can be reused
+
+                    // === Phase 2: Compute ₋₂Y (unnormalized), accumulate ===
+                    // ₋₂Y_unnorm = 2m/sin² × (alpha × Y_{l-1} - (l-1)×cos × Y)
+                    C inner = alpha * Ylm_prev - lm1 * cos_th * Ylm;
+                    C Ym2 = two_m * inv_sin_sq * inner;
+
+                    // Accumulate Ym2 contributions for each map
+                    // Ym2 uses parity_m2 for both U (in E) and Q (in B)
+                    for (int t = 0; t < n_maps_in_batch; t++) {
+                        R* sh_Gm_t = sh_Gm_base + t * 8 * ring_batch_size;
+
+                        // Get U Gm (parity_m2) for E equation
+                        C gm_U_re, gm_U_im;
                         if (parity_m2) {
                             gm_U_re = C(sh_Gm_t[6 * ring_batch_size + local_r]);
                             gm_U_im = C(sh_Gm_t[7 * ring_batch_size + local_r]);
@@ -2112,36 +2157,23 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                             gm_U_im = C(sh_Gm_t[5 * ring_batch_size + local_r]);
                         }
 
-                        // E = Q×₂Y + i×U×₋₂Y
-                        // E_re = GmQ_re×₂Y - GmU_im×₋₂Y
-                        // E_im = GmQ_im×₂Y + GmU_re×₋₂Y
-                        sum_E_re[t] += Y2 * gm_Q_re - Ym2 * gm_U_im;
-                        sum_E_im[t] += Y2 * gm_Q_im + Ym2 * gm_U_re;
-
-                        // B = Q×₋₂Y + i×U×₂Y
-                        // Need Q Gm with parity_m2 for ₋₂Y, U Gm with parity_s0 for ₂Y
-                        C gm_Q_m2_re, gm_Q_m2_im;
+                        // Get Q Gm (parity_m2) for B equation
+                        C gm_Q_re, gm_Q_im;
                         if (parity_m2) {
-                            gm_Q_m2_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
-                            gm_Q_m2_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
+                            gm_Q_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
+                            gm_Q_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
                         } else {
-                            gm_Q_m2_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
-                            gm_Q_m2_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
+                            gm_Q_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                            gm_Q_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
                         }
 
-                        C gm_U_p2_re, gm_U_p2_im;
-                        if (parity_s0) {
-                            gm_U_p2_re = C(sh_Gm_t[6 * ring_batch_size + local_r]);
-                            gm_U_p2_im = C(sh_Gm_t[7 * ring_batch_size + local_r]);
-                        } else {
-                            gm_U_p2_re = C(sh_Gm_t[4 * ring_batch_size + local_r]);
-                            gm_U_p2_im = C(sh_Gm_t[5 * ring_batch_size + local_r]);
-                        }
+                        // E: ₋₂Y × (i×U) contribution → -U_im, +U_re
+                        sum_E_re[t] -= Ym2 * gm_U_im;
+                        sum_E_im[t] += Ym2 * gm_U_re;
 
-                        // B_re = GmQ_re×₋₂Y - GmU_im×₂Y
-                        // B_im = GmQ_im×₋₂Y + GmU_re×₂Y
-                        sum_B_re[t] += Ym2 * gm_Q_m2_re - Y2 * gm_U_p2_im;
-                        sum_B_im[t] += Ym2 * gm_Q_m2_im + Y2 * gm_U_p2_re;
+                        // B: ₋₂Y × Q contribution
+                        sum_B_re[t] += Ym2 * gm_Q_re;
+                        sum_B_im[t] += Ym2 * gm_Q_im;
                     }
                 }
 
@@ -2165,16 +2197,20 @@ __global__ void reduce_to_alm_spin2_kernel_v6(
                         T* B_re_t = alm_B_re + (size_t)global_t * lp1 * lp1;
                         T* B_im_t = alm_B_im + (size_t)global_t * lp1 * lp1;
 
+                        // Apply deferred normalization: norm * pix_area
+                        // This saves one multiply per ring in the inner loop
+                        C scale = norm * C(pix_area);
+
                         if (batch_start == 0) {
-                            E_re_t[l * lp1 + m] = T(sEr * C(pix_area));
-                            E_im_t[l * lp1 + m] = T(sEi * C(pix_area));
-                            B_re_t[l * lp1 + m] = T(sBr * C(pix_area));
-                            B_im_t[l * lp1 + m] = T(sBi * C(pix_area));
+                            E_re_t[l * lp1 + m] = T(sEr * scale);
+                            E_im_t[l * lp1 + m] = T(sEi * scale);
+                            B_re_t[l * lp1 + m] = T(sBr * scale);
+                            B_im_t[l * lp1 + m] = T(sBi * scale);
                         } else {
-                            E_re_t[l * lp1 + m] = T(C(E_re_t[l * lp1 + m]) + sEr * C(pix_area));
-                            E_im_t[l * lp1 + m] = T(C(E_im_t[l * lp1 + m]) + sEi * C(pix_area));
-                            B_re_t[l * lp1 + m] = T(C(B_re_t[l * lp1 + m]) + sBr * C(pix_area));
-                            B_im_t[l * lp1 + m] = T(C(B_im_t[l * lp1 + m]) + sBi * C(pix_area));
+                            E_re_t[l * lp1 + m] = T(C(E_re_t[l * lp1 + m]) + sEr * scale);
+                            E_im_t[l * lp1 + m] = T(C(E_im_t[l * lp1 + m]) + sEi * scale);
+                            B_re_t[l * lp1 + m] = T(C(B_re_t[l * lp1 + m]) + sBr * scale);
+                            B_im_t[l * lp1 + m] = T(C(B_im_t[l * lp1 + m]) + sBi * scale);
                         }
                     }
                 }
@@ -2240,28 +2276,42 @@ void map2alm_cuda_v6_spin2_impl(
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
     // Phase 1: Compute Gm for Q and U maps using DFT
+    // Use two streams to process Q and U in parallel
     int block_size_p1 = min(256, lp1);
 
-    // Compute Gm for Q map
-    compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
+    cudaStream_t stream_Q, stream_U;
+    CUDA_CHECK(cudaStreamCreate(&stream_Q));
+    CUDA_CHECK(cudaStreamCreate(&stream_U));
+
+    // Allocate geometry buffers for U stream (cos/sin already allocated for Q)
+    R *cos_theta_U, *sin_theta_U;
+    CUDA_CHECK(cudaMalloc(&cos_theta_U, geom_size));
+    CUDA_CHECK(cudaMalloc(&sin_theta_U, geom_size));
+
+    // Launch both Gm computations in parallel
+    compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1, 0, stream_Q>>>(
         nside, l_max, n_maps, n_rings, map_Q,
         Gm_Q_even_re, Gm_Q_even_im, Gm_Q_odd_re, Gm_Q_odd_im,
         cos_theta, sin_theta
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Compute Gm for U map (geometry already computed)
-    R *dummy_cos, *dummy_sin;
-    CUDA_CHECK(cudaMalloc(&dummy_cos, geom_size));
-    CUDA_CHECK(cudaMalloc(&dummy_sin, geom_size));
-    compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1>>>(
+    compute_gm_kernel_v6<T, R><<<n_north_rings, block_size_p1, 0, stream_U>>>(
         nside, l_max, n_maps, n_rings, map_U,
         Gm_U_even_re, Gm_U_even_im, Gm_U_odd_re, Gm_U_odd_im,
-        dummy_cos, dummy_sin
+        cos_theta_U, sin_theta_U
     );
     CUDA_CHECK(cudaGetLastError());
-    cudaFree(dummy_cos);
-    cudaFree(dummy_sin);
+
+    // Wait for both streams to complete before Phase 2
+    CUDA_CHECK(cudaStreamSynchronize(stream_Q));
+    CUDA_CHECK(cudaStreamSynchronize(stream_U));
+
+    // Cleanup streams and extra geometry buffers
+    CUDA_CHECK(cudaStreamDestroy(stream_Q));
+    CUDA_CHECK(cudaStreamDestroy(stream_U));
+    cudaFree(cos_theta_U);
+    cudaFree(sin_theta_U);
 
     if (timing_enabled) {
         cudaEventRecord(end_p1);

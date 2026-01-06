@@ -142,6 +142,25 @@ def _get_pinned_buffers(size, use_f32):
 
 def _setup_functions(lib):
     """Set up function signatures for the C library."""
+    # ========== alm2cl functions ==========
+    # Auto-spectrum
+    lib.alm2cl_cuda_auto_f64.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_auto_f64.restype = None
+    lib.alm2cl_cuda_auto_f32.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_auto_f32.restype = None
+
+    # Cross-spectrum
+    lib.alm2cl_cuda_cross_f64.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_cross_f64.restype = None
+    lib.alm2cl_cuda_cross_f32.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_cross_f32.restype = None
+
+    # All pairs (auto + cross)
+    lib.alm2cl_cuda_all_pairs_f64.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_all_pairs_f64.restype = None
+    lib.alm2cl_cuda_all_pairs_f32.argtypes = [c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.alm2cl_cuda_all_pairs_f32.restype = None
+
     # map2alm_cuda
     lib.map2alm_cuda.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p]
     lib.map2alm_cuda.restype = None
@@ -1479,3 +1498,456 @@ def combine_to_complex(alm_real: np.ndarray, alm_imag: np.ndarray) -> np.ndarray
     interleaved[:, 1] = alm_imag.ravel()
     complex_dtype = np.complex64 if alm_real.dtype == np.float32 else np.complex128
     return interleaved.view(complex_dtype).reshape(alm_real.shape)
+
+
+# =============================================================================
+# Power Spectrum Functions
+# =============================================================================
+
+def alm2cl_cuda(l_max: int, alm_real: np.ndarray, alm_imag: np.ndarray,
+                alm2_real: np.ndarray = None, alm2_imag: np.ndarray = None) -> np.ndarray:
+    """
+    Compute angular power spectrum C_l from alm coefficients on GPU.
+
+    Args:
+        l_max: Maximum multipole
+        alm_real: Real part of alm, shape [n_fields, l_max+1, l_max+1]
+        alm_imag: Imaginary part of alm, shape [n_fields, l_max+1, l_max+1]
+        alm2_real: Optional second alm real part for cross-spectrum
+        alm2_imag: Optional second alm imaginary part for cross-spectrum
+
+    Returns:
+        cl: Power spectra, shape [n_fields, l_max+1] for auto-spectra
+            or [n_fields, l_max+1] for cross-spectra
+    """
+    lib = _get_lib()
+    cuda_rt = _get_cuda_rt()
+
+    use_f32 = (alm_real.dtype == np.float32)
+    n_fields = alm_real.shape[0]
+    lp1 = l_max + 1
+
+    # Ensure contiguous
+    alm_real = np.ascontiguousarray(alm_real)
+    alm_imag = np.ascontiguousarray(alm_imag)
+
+    # Sizes
+    alm_size = n_fields * lp1 * lp1 * alm_real.itemsize
+    cl_size = n_fields * lp1 * alm_real.itemsize
+
+    # Allocate device memory
+    d_alm_real = ctypes.c_void_p()
+    d_alm_imag = ctypes.c_void_p()
+    d_cl = ctypes.c_void_p()
+
+    cuda_rt.cudaMalloc(ctypes.byref(d_alm_real), alm_size)
+    cuda_rt.cudaMalloc(ctypes.byref(d_alm_imag), alm_size)
+    cuda_rt.cudaMalloc(ctypes.byref(d_cl), cl_size)
+
+    # Copy alm to device
+    cuda_rt.cudaMemcpy(d_alm_real, alm_real.ctypes.data_as(c_void_p), alm_size, 1)
+    cuda_rt.cudaMemcpy(d_alm_imag, alm_imag.ctypes.data_as(c_void_p), alm_size, 1)
+
+    try:
+        if alm2_real is None:
+            # Auto-spectrum
+            if use_f32:
+                lib.alm2cl_cuda_auto_f32(l_max, n_fields, d_alm_real, d_alm_imag, d_cl)
+            else:
+                lib.alm2cl_cuda_auto_f64(l_max, n_fields, d_alm_real, d_alm_imag, d_cl)
+        else:
+            # Cross-spectrum
+            alm2_real = np.ascontiguousarray(alm2_real)
+            alm2_imag = np.ascontiguousarray(alm2_imag)
+
+            d_alm2_real = ctypes.c_void_p()
+            d_alm2_imag = ctypes.c_void_p()
+            cuda_rt.cudaMalloc(ctypes.byref(d_alm2_real), alm_size)
+            cuda_rt.cudaMalloc(ctypes.byref(d_alm2_imag), alm_size)
+            cuda_rt.cudaMemcpy(d_alm2_real, alm2_real.ctypes.data_as(c_void_p), alm_size, 1)
+            cuda_rt.cudaMemcpy(d_alm2_imag, alm2_imag.ctypes.data_as(c_void_p), alm_size, 1)
+
+            try:
+                if use_f32:
+                    lib.alm2cl_cuda_cross_f32(l_max, n_fields, d_alm_real, d_alm_imag,
+                                              d_alm2_real, d_alm2_imag, d_cl)
+                else:
+                    lib.alm2cl_cuda_cross_f64(l_max, n_fields, d_alm_real, d_alm_imag,
+                                              d_alm2_real, d_alm2_imag, d_cl)
+            finally:
+                cuda_rt.cudaFree(d_alm2_real)
+                cuda_rt.cudaFree(d_alm2_imag)
+
+        # Copy result back
+        cl = np.zeros((n_fields, lp1), dtype=alm_real.dtype)
+        cuda_rt.cudaMemcpy(cl.ctypes.data_as(c_void_p), d_cl, cl_size, 2)
+
+    finally:
+        cuda_rt.cudaFree(d_alm_real)
+        cuda_rt.cudaFree(d_alm_imag)
+        cuda_rt.cudaFree(d_cl)
+
+    return cl
+
+
+def alm2cl_cuda_all_pairs(l_max: int, alm_real: np.ndarray, alm_imag: np.ndarray) -> np.ndarray:
+    """
+    Compute all auto and cross power spectra for multiple fields.
+
+    For n_fields, computes n_fields*(n_fields+1)/2 spectra.
+
+    Args:
+        l_max: Maximum multipole
+        alm_real: Real part of alm, shape [n_fields, l_max+1, l_max+1]
+        alm_imag: Imaginary part of alm, shape [n_fields, l_max+1, l_max+1]
+
+    Returns:
+        cl: Power spectra, shape [n_pairs, l_max+1]
+            Pairs are ordered as: (0,0), (0,1), ..., (0,n-1), (1,1), (1,2), ..., (n-1,n-1)
+    """
+    lib = _get_lib()
+    cuda_rt = _get_cuda_rt()
+
+    use_f32 = (alm_real.dtype == np.float32)
+    n_fields = alm_real.shape[0]
+    n_pairs = n_fields * (n_fields + 1) // 2
+    lp1 = l_max + 1
+
+    # Ensure contiguous
+    alm_real = np.ascontiguousarray(alm_real)
+    alm_imag = np.ascontiguousarray(alm_imag)
+
+    # Sizes
+    alm_size = n_fields * lp1 * lp1 * alm_real.itemsize
+    cl_size = n_pairs * lp1 * alm_real.itemsize
+
+    # Allocate device memory
+    d_alm_real = ctypes.c_void_p()
+    d_alm_imag = ctypes.c_void_p()
+    d_cl = ctypes.c_void_p()
+
+    cuda_rt.cudaMalloc(ctypes.byref(d_alm_real), alm_size)
+    cuda_rt.cudaMalloc(ctypes.byref(d_alm_imag), alm_size)
+    cuda_rt.cudaMalloc(ctypes.byref(d_cl), cl_size)
+
+    # Copy alm to device
+    cuda_rt.cudaMemcpy(d_alm_real, alm_real.ctypes.data_as(c_void_p), alm_size, 1)
+    cuda_rt.cudaMemcpy(d_alm_imag, alm_imag.ctypes.data_as(c_void_p), alm_size, 1)
+
+    try:
+        if use_f32:
+            lib.alm2cl_cuda_all_pairs_f32(l_max, n_fields, d_alm_real, d_alm_imag, d_cl)
+        else:
+            lib.alm2cl_cuda_all_pairs_f64(l_max, n_fields, d_alm_real, d_alm_imag, d_cl)
+
+        # Copy result back
+        cl = np.zeros((n_pairs, lp1), dtype=alm_real.dtype)
+        cuda_rt.cudaMemcpy(cl.ctypes.data_as(c_void_p), d_cl, cl_size, 2)
+
+    finally:
+        cuda_rt.cudaFree(d_alm_real)
+        cuda_rt.cudaFree(d_alm_imag)
+        cuda_rt.cudaFree(d_cl)
+
+    return cl
+
+
+def get_pair_indices(n_fields: int) -> list:
+    """
+    Get list of (field1, field2) tuples for pair indexing.
+
+    Returns pairs in order: (0,0), (0,1), ..., (0,n-1), (1,1), (1,2), ..., (n-1,n-1)
+    """
+    pairs = []
+    for f1 in range(n_fields):
+        for f2 in range(f1, n_fields):
+            pairs.append((f1, f2))
+    return pairs
+
+
+def _parse_map_input(maps, nside):
+    """
+    Parse mixed spin-0/spin-2 map input into separate batches.
+
+    Input format examples:
+        [T]                      -> spin-0: [T], spin-2: []
+        [T, [Q, U]]              -> spin-0: [T], spin-2: [[Q, U]]
+        [[Q1, U1], [Q2, U2]]     -> spin-0: [], spin-2: [[Q1, U1], [Q2, U2]]
+        [T1, [Q1, U1], T2, [Q2, U2]] -> spin-0: [T1, T2], spin-2: [[Q1, U1], [Q2, U2]]
+
+    Returns:
+        spin0_maps: np.ndarray of shape [n_spin0, n_rings, 4*nside] or None
+        spin2_maps: np.ndarray of shape [n_spin2, n_rings, 4*nside, 2] or None
+        field_labels: List of ('T', idx) or ('E', idx) or ('B', idx) tuples
+        field_indices: Dict mapping label to index in concatenated alm array
+    """
+    n_rings = 4 * nside - 1
+    max_pix = 4 * nside
+
+    spin0_list = []
+    spin2_list = []
+    field_labels = []
+
+    spin0_idx = 0
+    spin2_idx = 0
+
+    for item in maps:
+        item = np.asarray(item)
+
+        # Check if this is a spin-2 map (has 2 components)
+        if item.ndim == 3 and item.shape[0] == 2:
+            # Spin-2: [2, n_rings, max_pix] -> Q, U
+            Q = item[0]
+            U = item[1]
+            spin2_list.append(np.stack([Q, U], axis=-1))  # [n_rings, max_pix, 2]
+            field_labels.append(('E', spin2_idx))
+            field_labels.append(('B', spin2_idx))
+            spin2_idx += 1
+        elif item.ndim == 2:
+            # Spin-0: [n_rings, max_pix]
+            spin0_list.append(item)
+            field_labels.append(('T', spin0_idx))
+            spin0_idx += 1
+        elif item.ndim == 1:
+            # 1D HEALPix format [npix]
+            if item.shape[0] == 12 * nside**2:
+                # Need to reshape to ring format
+                raise ValueError("1D HEALPix format not supported in map2cl. "
+                               "Please use 2D ring format [n_rings, 4*nside].")
+            else:
+                raise ValueError(f"Unexpected 1D array shape: {item.shape}")
+        else:
+            raise ValueError(f"Unexpected array shape: {item.shape}. "
+                           "Expected [n_rings, max_pix] for spin-0 or "
+                           "[2, n_rings, max_pix] for spin-2.")
+
+    spin0_maps = np.stack(spin0_list, axis=0) if spin0_list else None
+    spin2_maps = np.stack(spin2_list, axis=0) if spin2_list else None
+
+    # Build field indices
+    field_indices = {}
+    idx = 0
+    for label in field_labels:
+        field_indices[label] = idx
+        idx += 1
+
+    return spin0_maps, spin2_maps, field_labels, field_indices
+
+
+class SPHTCudaMap2Cl:
+    """
+    High-level interface for computing power spectra directly from maps.
+
+    This class handles mixed spin-0 and spin-2 inputs, automatically batching
+    transforms and computing all auto and cross power spectra.
+    """
+
+    def __init__(self, nside: int, l_max: int = None, version: str = "v6",
+                 storage_precision: str = None, recurrence_precision: str = None):
+        """
+        Initialize Map2Cl context.
+
+        Args:
+            nside: HEALPix nside parameter
+            l_max: Maximum multipole (default: 3*nside)
+            version: SPHT version to use (default: "v6")
+            storage_precision: 'float64' or 'float32' (default: global config)
+            recurrence_precision: 'float64' or 'float32' (default: global config)
+        """
+        self.nside = nside
+        self.l_max = l_max if l_max is not None else 3 * nside
+        self.n_rings = 4 * nside - 1
+        self.version = version
+        self.storage_precision = storage_precision or config.storage_precision
+        self.recurrence_precision = recurrence_precision or config.recurrence_precision
+        self._spht = SPHTCuda(nside, self.l_max, version,
+                              storage_precision, recurrence_precision)
+        self._lib = _get_lib()
+
+    def map2cl(self, maps: list, return_dict: bool = True):
+        """
+        Compute all auto and cross power spectra from maps.
+
+        Args:
+            maps: List of maps in mixed format:
+                  - Spin-0 (T): array of shape [n_rings, 4*nside]
+                  - Spin-2 (Q,U): array of shape [2, n_rings, 4*nside]
+                  Examples:
+                    [T]  - single temperature map
+                    [T, [Q, U]]  - temperature and polarization
+                    [[Q1, U1], [Q2, U2]]  - two polarization maps
+                    [T1, [Q1, U1], T2, [Q2, U2]]  - two full TQU sets
+            return_dict: If True, return dict with spectrum labels as keys.
+                        If False, return raw array and field labels.
+
+        Returns:
+            If return_dict=True:
+                Dict with keys like 'TT', 'TE', 'TB', 'EE', 'EB', 'BB',
+                'T1T2', 'E1E2', etc. Values are C_l arrays of shape [l_max+1]
+            If return_dict=False:
+                Tuple of (cl_array, field_labels, pair_indices)
+                where cl_array has shape [n_pairs, l_max+1]
+        """
+        use_f32 = (self.storage_precision == "float32")
+        dtype = np.float32 if use_f32 else np.float64
+
+        # Parse input
+        spin0_maps, spin2_maps, field_labels, field_indices = _parse_map_input(maps, self.nside)
+
+        # Compute alm for all fields
+        all_alm_real = []
+        all_alm_imag = []
+
+        # Process spin-0 maps
+        if spin0_maps is not None:
+            spin0_maps = spin0_maps.astype(dtype)
+            n_spin0 = spin0_maps.shape[0]
+            alm_result = self._spht.map2alm({0: spin0_maps}, spins=(0,), return_split=True)
+            alm_real, alm_imag = alm_result[0]
+            for i in range(n_spin0):
+                all_alm_real.append(alm_real[i])
+                all_alm_imag.append(alm_imag[i])
+
+        # Process spin-2 maps
+        if spin2_maps is not None:
+            spin2_maps = spin2_maps.astype(dtype)
+            n_spin2 = spin2_maps.shape[0]
+            alm_result = self._spht.map2alm({2: spin2_maps}, spins=(2,), return_split=True)
+            (E_real, E_imag), (B_real, B_imag) = alm_result[2]
+            for i in range(n_spin2):
+                all_alm_real.append(E_real[i])
+                all_alm_imag.append(E_imag[i])
+                all_alm_real.append(B_real[i])
+                all_alm_imag.append(B_imag[i])
+
+        # Stack all alm arrays
+        n_fields = len(all_alm_real)
+        all_alm_real = np.stack(all_alm_real, axis=0)
+        all_alm_imag = np.stack(all_alm_imag, axis=0)
+
+        # Compute all power spectra on GPU
+        cl_array = alm2cl_cuda_all_pairs(self.l_max, all_alm_real, all_alm_imag)
+
+        if not return_dict:
+            pairs = get_pair_indices(n_fields)
+            return cl_array, field_labels, pairs
+
+        # Build labeled dictionary
+        pairs = get_pair_indices(n_fields)
+        cl_dict = {}
+
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            label1 = field_labels[f1]
+            label2 = field_labels[f2]
+
+            # Create spectrum label
+            type1, idx1 = label1
+            type2, idx2 = label2
+
+            if idx1 == idx2:
+                # Same map set
+                key = f"{type1}{type2}"
+            else:
+                # Cross between different map sets
+                key = f"{type1}{idx1+1}{type2}{idx2+1}"
+
+            # Handle duplicate keys (e.g., multiple T maps)
+            if key in cl_dict:
+                # Find a unique key
+                base_key = key
+                counter = 2
+                while key in cl_dict:
+                    key = f"{base_key}_{counter}"
+                    counter += 1
+
+            cl_dict[key] = cl_array[pair_idx]
+
+        return cl_dict
+
+    def map2alm(self, maps: list, return_split: bool = False):
+        """
+        Compute alm from maps (convenience wrapper).
+
+        Args:
+            maps: List of maps in mixed format (same as map2cl)
+            return_split: If True, return split real/imag arrays
+
+        Returns:
+            Dict mapping field labels to alm arrays
+        """
+        use_f32 = (self.storage_precision == "float32")
+        dtype = np.float32 if use_f32 else np.float64
+
+        spin0_maps, spin2_maps, field_labels, field_indices = _parse_map_input(maps, self.nside)
+
+        result = {}
+
+        if spin0_maps is not None:
+            spin0_maps = spin0_maps.astype(dtype)
+            alm_result = self._spht.map2alm({0: spin0_maps}, spins=(0,), return_split=return_split)
+            if return_split:
+                alm_real, alm_imag = alm_result[0]
+                for i, label in enumerate(field_labels):
+                    if label[0] == 'T':
+                        result[label] = (alm_real[i], alm_imag[i])
+            else:
+                for i, label in enumerate(field_labels):
+                    if label[0] == 'T':
+                        result[label] = alm_result[0][i]
+
+        if spin2_maps is not None:
+            spin2_maps = spin2_maps.astype(dtype)
+            alm_result = self._spht.map2alm({2: spin2_maps}, spins=(2,), return_split=return_split)
+            if return_split:
+                (E_real, E_imag), (B_real, B_imag) = alm_result[2]
+                eb_idx = 0
+                for label in field_labels:
+                    if label[0] == 'E':
+                        idx = label[1]
+                        result[('E', idx)] = (E_real[idx], E_imag[idx])
+                    elif label[0] == 'B':
+                        idx = label[1]
+                        result[('B', idx)] = (B_real[idx], B_imag[idx])
+            else:
+                for label in field_labels:
+                    if label[0] == 'E':
+                        idx = label[1]
+                        result[('E', idx)] = alm_result[2][idx, :, :, 0]
+                    elif label[0] == 'B':
+                        idx = label[1]
+                        result[('B', idx)] = alm_result[2][idx, :, :, 1]
+
+        return result
+
+
+def map2cl_cuda(nside: int, l_max: int, maps: list, **kwargs) -> dict:
+    """
+    Convenience function to compute power spectra from maps.
+
+    Args:
+        nside: HEALPix nside parameter
+        l_max: Maximum multipole
+        maps: List of maps in mixed format:
+              - Spin-0 (T): array of shape [n_rings, 4*nside]
+              - Spin-2 (Q,U): array of shape [2, n_rings, 4*nside]
+        **kwargs: Additional arguments passed to SPHTCudaMap2Cl
+
+    Returns:
+        Dict with spectrum labels as keys (e.g., 'TT', 'TE', 'EE', 'BB')
+        and C_l arrays as values.
+
+    Example:
+        # Single temperature map
+        cl = map2cl_cuda(nside, l_max, [T_map])
+        # cl['TT'] is the temperature power spectrum
+
+        # Temperature and polarization
+        cl = map2cl_cuda(nside, l_max, [T_map, [Q_map, U_map]])
+        # cl['TT'], cl['TE'], cl['TB'], cl['EE'], cl['EB'], cl['BB']
+
+        # Two map sets for cross-correlation
+        cl = map2cl_cuda(nside, l_max, [T1, [Q1, U1], T2, [Q2, U2]])
+        # Includes all auto and cross spectra
+    """
+    m2cl = SPHTCudaMap2Cl(nside, l_max, **kwargs)
+    return m2cl.map2cl(maps)

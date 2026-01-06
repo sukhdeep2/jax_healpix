@@ -138,6 +138,10 @@ __global__ void compute_fmy_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
+    // Precompute m-dependent values (used throughout kernel)
+    C m2_precomp = C(m * m);
+    C recur_c_m1 = Traits::sqrt_d(C(2*m + 3));  // For l = m+1 recurrence
+
     // Shared memory for ring geometry and alm (loaded per batch)
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
@@ -250,16 +254,15 @@ __global__ void compute_fmy_kernel_v6(
                     if (l == m) {
                         Ylm = Ymm;
                     } else if (l == m + 1) {
-                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_p1;
+                        Ylm = cos_th * recur_c_m1 * Ylm_p1;
                         Ylm_p2 = Ylm_p1;
                         Ylm_p1 = Ylm;
                     } else {
                         C l2 = C(l * l);
-                        C m2 = C(m * m);
                         C lm1_2 = C((l-1) * (l-1));
 
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_precomp));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_precomp) / (l2 - m2_precomp));
 
                         Ylm = A * cos_th * Ylm_p1 - B * Ylm_p2;
                         Ylm_p2 = Ylm_p1;
@@ -724,6 +727,11 @@ __global__ void compute_fmy_spin2_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
+    // Precompute m-dependent values (used throughout kernel)
+    C m2_precomp = C(m * m);
+    C two_m_precomp = C(2 * m);
+    C recur_c_m1 = Traits::sqrt_d(C(2*m + 3));  // For l = m+1 recurrence
+
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
@@ -829,15 +837,14 @@ __global__ void compute_fmy_spin2_kernel_v6(
 
                 for (int l = m + 1; l < l_start; l++) {
                     if (l == m + 1) {
-                        C Yl_new = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_p1;
+                        C Yl_new = cos_th * recur_c_m1 * Ylm_p1;
                         Ylm_p2 = Ylm_p1;
                         Ylm_p1 = Yl_new;
                     } else {
                         C l2 = C(l * l);
-                        C m2_val = C(m * m);
                         C lm1_2 = C((l-1) * (l-1));
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_val));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_val) / (l2 - m2_val));
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_precomp));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_precomp) / (l2 - m2_precomp));
                         C Yl_new = A * cos_th * Ylm_p1 - B * Ylm_p2;
                         Ylm_p2 = Ylm_p1;
                         Ylm_p1 = Yl_new;
@@ -851,16 +858,15 @@ __global__ void compute_fmy_spin2_kernel_v6(
                         Ylm = Ymm;
                         Ylm_prev = C(0);
                     } else if (l == m + 1) {
-                        Ylm = cos_th * Traits::sqrt_d(C(2*m + 3)) * Ylm_p1;
+                        Ylm = cos_th * recur_c_m1 * Ylm_p1;
                         Ylm_prev = Ylm_p1;
                         Ylm_p2 = Ylm_p1;
                         Ylm_p1 = Ylm;
                     } else {
                         C l2 = C(l * l);
-                        C m2_val = C(m * m);
                         C lm1_2 = C((l-1) * (l-1));
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_val));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_val) / (l2 - m2_val));
+                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_precomp));
+                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_precomp) / (l2 - m2_precomp));
                         Ylm = A * cos_th * Ylm_p1 - B * Ylm_p2;
                         Ylm_prev = Ylm_p1;
                         Ylm_p2 = Ylm_p1;
@@ -870,15 +876,14 @@ __global__ void compute_fmy_spin2_kernel_v6(
                     // Compute spin-2 harmonics
                     C norm = compute_spin2_norm_synth<C>(l);
                     C alpha = compute_alpha_lm_synth<C>(l, m);
-                    C m2 = C(m * m);
                     C ll1 = C(l * (l - 1));
 
-                    C coeff1 = (C(2) * (m2 - C(l)) * inv_sin_sq - ll1);
+                    C coeff1 = (C(2) * (m2_precomp - C(l)) * inv_sin_sq - ll1);
                     C coeff2 = C(2) * alpha * cos_th * inv_sin_sq;
                     C Y2 = norm * (coeff1 * Ylm + coeff2 * Ylm_prev);
 
                     C inner = alpha * Ylm_prev - C(l - 1) * cos_th * Ylm;
-                    C Ym2 = norm * C(2) * C(m) * inv_sin_sq * inner;
+                    C Ym2 = norm * two_m_precomp * inv_sin_sq * inner;
 
                     // Get alm values
                     C alm_E_r = C(sh_alm_E_re[l]);
@@ -1156,8 +1161,32 @@ void alm2map_cuda_v6_spin2_impl(
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
     // Phase 1: Compute Fmy
+    // Compute shared memory requirements and adjust ring_batch_size if needed
+    const size_t MAX_SMEM = 48 * 1024;  // 48KB default limit
+    size_t alm_smem = 4 * lp1 * sizeof(T);  // E/B re/im for all l
+    size_t avail_for_rings = (alm_smem < MAX_SMEM) ? (MAX_SMEM - alm_smem) : 0;
     int ring_batch_size = RING_BATCH_SIZE;
-    size_t smem_p1 = 2 * ring_batch_size * sizeof(R) + 4 * lp1 * sizeof(T);
+
+    // Reduce ring_batch_size if needed to fit in shared memory
+    while (ring_batch_size > 32 && 2 * ring_batch_size * sizeof(R) > avail_for_rings) {
+        ring_batch_size /= 2;
+    }
+
+    size_t smem_p1 = 2 * ring_batch_size * sizeof(R) + alm_smem;
+
+    // Request extended shared memory if needed (up to 100KB on compute 8.x)
+    if (smem_p1 > MAX_SMEM) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            compute_fmy_spin2_kernel_v6<T, R>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p1);
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "Error: Spin-2 alm2map requires %zu bytes shared memory "
+                    "(l_max=%d), but GPU limit exceeded.\n"
+                    "Try using float32 storage precision for large nside.\n",
+                    smem_p1, l_max);
+            return;
+        }
+    }
 
     compute_fmy_spin2_kernel_v6<T, R><<<lp1, 32, smem_p1>>>(
         nside, l_max, n_maps, n_north_rings,
@@ -1180,8 +1209,31 @@ void alm2map_cuda_v6_spin2_impl(
     CUDA_CHECK(cudaMemset(map_U_out, 0, (size_t)n_maps * n_rings * max_pix * sizeof(T)));
 
     // Phase 2: Synthesize maps
+    // Spin-2 needs 8 Fmy arrays (Q/U × even/odd × re/im)
     size_t smem_p2 = 8 * lp1 * sizeof(R);
     int block_size_p2 = 256;
+
+    // Request extended shared memory if needed
+    if (smem_p2 > MAX_SMEM) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            synthesize_map_spin2_kernel_v6<T, R>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p2);
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "Error: Spin-2 alm2map Phase 2 requires %zu bytes shared memory "
+                    "(l_max=%d), but GPU limit exceeded.\n"
+                    "Try using float32 storage precision for large nside.\n",
+                    smem_p2, l_max);
+            // Clean up allocated memory
+            cudaFree(alm_E_scaled_re); cudaFree(alm_E_scaled_im);
+            cudaFree(alm_B_scaled_re); cudaFree(alm_B_scaled_im);
+            cudaFree(Fmy_Q_even_re); cudaFree(Fmy_Q_even_im);
+            cudaFree(Fmy_Q_odd_re); cudaFree(Fmy_Q_odd_im);
+            cudaFree(Fmy_U_even_re); cudaFree(Fmy_U_even_im);
+            cudaFree(Fmy_U_odd_re); cudaFree(Fmy_U_odd_im);
+            cudaFree(cos_theta); cudaFree(sin_theta);
+            return;
+        }
+    }
 
     synthesize_map_spin2_kernel_v6<T, R><<<n_north_rings, block_size_p2, smem_p2>>>(
         nside, l_max, n_maps, n_rings, n_north_rings,

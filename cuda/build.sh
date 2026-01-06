@@ -69,6 +69,7 @@ SOURCES=(
     "map2alm_v6.cu"    # Optimal warp-per-m, NO atomics
     "alm2map_v5.cu"    # Multi-precision synthesis version
     "alm2map_v6.cu"    # Optimal warp-per-m synthesis (matching map2alm_v6)
+    "alm2cl.cu"        # Power spectrum computation
     "fft_gm.cu"        # FFT-based Gm
     "spht_api.cu"
 )
