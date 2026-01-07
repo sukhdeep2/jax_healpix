@@ -21,6 +21,7 @@
 #include <cufft.h>
 #include "../include/spht_types.h"
 #include "../include/bluestein_fft.h"
+#include "../include/log_arithmetic.cuh"
 #include <stdio.h>
 #include <type_traits>
 
@@ -185,9 +186,15 @@ __global__ void compute_fmy_kernel_v6(
     T* sh_alm_re = (T*)(sh_sin_th + ring_batch_size);
     T* sh_alm_im = sh_alm_re + lp1;
 
-    // Per-lane Ylm recurrence state
-    C Ylm_prev1[MAX_RINGS_PER_LANE];
-    C Ylm_prev2[MAX_RINGS_PER_LANE];
+    // Per-lane Ylm recurrence state in LOG-SPACE
+    // We store log(|Ylm|) and sign separately for numerical stability
+    C log_Ylm_prev1[MAX_RINGS_PER_LANE];
+    C log_Ylm_prev2[MAX_RINGS_PER_LANE];
+    int8_t sign_prev1[MAX_RINGS_PER_LANE];
+    int8_t sign_prev2[MAX_RINGS_PER_LANE];
+
+    // Log-space traits
+    using LogTraits = LogArithmeticTraits<C>;
 
     // Determine global ring indices this lane handles
     int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
@@ -229,19 +236,25 @@ __global__ void compute_fmy_kernel_v6(
         int k_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
         k_end = min(k_end, n_my_rings_total);
 
-        // Initialize Y[m,m] for rings in this batch
+        // Initialize Y[m,m] in LOG-SPACE for rings in this batch
+        // Reference: jax_healpix/YLM_jax_log.py sYLM_ll0_log()
+        C log_prefact = compute_log_prefact_ymm<C>(m);
+        C log_norm = -C(0.5) * LogTraits::log_d(C(4.0) * LogTraits::PI_VAL);
+
         for (int k = k_start; k < k_end; k++) {
             int global_r = lane + 32 * k;
             int local_r = global_r - batch_start;
             C sin_th = C(sh_sin_th[local_r]);
 
-            C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
-            for (int j = 1; j <= m; j++) {
-                Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
-            }
+            // Y[m,m] = (-1)^m * sin(th)^m * prefact / sqrt(4*pi)
+            C log_sin_th = safe_log_typed<C>(sin_th);
+            C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
+            int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);  // (-1)^m
 
-            Ylm_prev1[k] = Ymm;
-            Ylm_prev2[k] = C(0);
+            log_Ylm_prev1[k] = log_Ymm;
+            sign_prev1[k] = sign_Ymm;
+            log_Ylm_prev2[k] = LogTraits::LOG_MIN;  // Zero in log-space
+            sign_prev2[k] = 0;
         }
 
         __syncwarp();
@@ -259,50 +272,70 @@ __global__ void compute_fmy_kernel_v6(
             }
             __syncwarp();
 
-            // Reset Ylm state for each map (recompute from cached initial values)
-            // Actually, we need to recompute Ylm once per batch, not per map
-            // Since Ylm doesn't depend on the map, compute once and reuse
-
             // For each ring this lane handles, compute Fmy = sum_l(alm * Ylm)
+            // Using LOG-SPACE Ylm recurrence for numerical stability
             for (int k = k_start; k < k_end; k++) {
                 int global_r = lane + 32 * k;
                 int local_r = global_r - batch_start;
                 C cos_th = C(sh_cos_th[local_r]);
                 C sin_th = C(sh_sin_th[local_r]);
+                C log_cos_th = safe_log_typed<C>(cos_th);
+                int8_t sign_cos_th = (cos_th >= C(0)) ? int8_t(1) : int8_t(-1);
 
                 // Accumulate Fmy for north and south rings
                 C fmy_n_re = C(0), fmy_n_im = C(0);
                 C fmy_s_re = C(0), fmy_s_im = C(0);
 
-                // Recompute Ylm for this ring (needed fresh for each map iteration)
-                C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
-                for (int j = 1; j <= m; j++) {
-                    Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
-                }
+                // Reset log-space Ylm state to initial Y[m,m] values
+                C log_sin_th = safe_log_typed<C>(sin_th);
+                C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
+                int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);
 
-                C Ylm_p1 = Ymm;
-                C Ylm_p2 = C(0);
+                C log_Ylm_p1 = log_Ymm;
+                int8_t sign_p1 = sign_Ymm;
+                C log_Ylm_p2 = LogTraits::LOG_MIN;
+                int8_t sign_p2 = 0;
+
+                // Log-space recurrence coefficient for l = m+1
+                C log_recur_C = C(0.5) * LogTraits::log_d(C(2*m + 3));
 
                 // Ylm recurrence and accumulation
                 for (int l = m; l <= l_max; l++) {
-                    C Ylm;
+                    C log_Ylm;
+                    int8_t sign_Ylm;
+
                     if (l == m) {
-                        Ylm = Ymm;
+                        log_Ylm = log_Ymm;
+                        sign_Ylm = sign_Ymm;
                     } else if (l == m + 1) {
-                        Ylm = cos_th * recur_c_m1 * Ylm_p1;
-                        Ylm_p2 = Ylm_p1;
-                        Ylm_p1 = Ylm;
+                        // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
+                        log_Ylm = log_cos_th + log_recur_C + log_Ylm_p1;
+                        sign_Ylm = sign_cos_th * sign_p1;
+
+                        log_Ylm_p2 = log_Ylm_p1;
+                        sign_p2 = sign_p1;
+                        log_Ylm_p1 = log_Ylm;
+                        sign_p1 = sign_Ylm;
                     } else {
-                        C l2 = C(l * l);
-                        C lm1_2 = C((l-1) * (l-1));
+                        // Y[l,m] = A*cos_th*Y[l-1,m] - B*Y[l-2,m]
+                        C log_A = log_A_lm<C>(l, m);
+                        C log_B = log_B_lm<C>(l, m);
 
-                        C A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2_precomp));
-                        C B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2_precomp) / (l2 - m2_precomp));
+                        C R1 = log_A + log_cos_th + log_Ylm_p1;
+                        int8_t S1 = sign_cos_th * sign_p1;
+                        C R2 = log_B + log_Ylm_p2;
+                        int8_t S2 = -sign_p2;  // Negative due to subtraction
 
-                        Ylm = A * cos_th * Ylm_p1 - B * Ylm_p2;
-                        Ylm_p2 = Ylm_p1;
-                        Ylm_p1 = Ylm;
+                        logsumexp_typed<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+
+                        log_Ylm_p2 = log_Ylm_p1;
+                        sign_p2 = sign_p1;
+                        log_Ylm_p1 = log_Ylm;
+                        sign_p1 = sign_Ylm;
                     }
+
+                    // Convert to LINEAR for alm * Ylm multiplication
+                    C Ylm = sign_Ylm * LogTraits::exp_d(clamp_log_typed<C>(log_Ylm));
 
                     // alm * Ylm contribution
                     C alm_re = C(sh_alm_re[l]);
@@ -314,9 +347,9 @@ __global__ void compute_fmy_kernel_v6(
 
                     // South: Ylm(-cos_theta) = (-1)^(l+m) * Ylm(cos_theta)
                     int parity = (l + m) & 1;
-                    C sign_ns = parity ? C(-1) : C(1);
-                    fmy_s_re += alm_re * (sign_ns * Ylm);
-                    fmy_s_im += alm_im * (sign_ns * Ylm);
+                    C parity_sign = parity ? C(-1) : C(1);
+                    fmy_s_re += alm_re * (parity_sign * Ylm);
+                    fmy_s_im += alm_im * (parity_sign * Ylm);
                 }
 
                 // Combine N/S: Fmy_even = Fmy_n + Fmy_s, Fmy_odd = Fmy_n - Fmy_s

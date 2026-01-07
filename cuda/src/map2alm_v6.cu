@@ -19,6 +19,7 @@
 #include <cuda_bf16.h>
 #include <cufft.h>
 #include "../include/spht_types.h"
+#include "../include/log_arithmetic.cuh"
 #include <stdio.h>
 #include <type_traits>
 
@@ -1107,11 +1108,15 @@ __global__ void reduce_to_alm_kernel_v6(
     // Gm arrays for parallel maps (2 arrays per map - half of before!)
     R* sh_Gm_base = sh_sin_th + ring_batch_size;
 
-    // Per-lane Ylm recurrence state (local memory, L1 cached)
-    C Ylm_prev1[MAX_RINGS_PER_LANE];
-    C Ylm_prev2[MAX_RINGS_PER_LANE];
+    // Per-lane Ylm recurrence state in LOG-SPACE (local memory, L1 cached)
+    // We store log(|Ylm|) and sign separately for numerical stability
+    C log_Ylm_prev1[MAX_RINGS_PER_LANE];
+    C log_Ylm_prev2[MAX_RINGS_PER_LANE];
+    int8_t sign_prev1[MAX_RINGS_PER_LANE];
+    int8_t sign_prev2[MAX_RINGS_PER_LANE];
     // Save initial Ymm for restoring between north/south passes
-    C Ymm_saved[MAX_RINGS_PER_LANE];
+    C log_Ymm_saved[MAX_RINGS_PER_LANE];
+    int8_t sign_Ymm_saved[MAX_RINGS_PER_LANE];
 
     // Per-lane accumulators for each parallel map
     C sum_re[MAX_PARALLEL_MAPS_F32];
@@ -1141,20 +1146,30 @@ __global__ void reduce_to_alm_kernel_v6(
             int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
             k_end = min(k_end, n_my_rings_total);
 
-            // Compute and save initial Y[m,m] for rings in this batch
+            // Compute and save initial Y[m,m] in LOG-SPACE for rings in this batch
+            // Reference: jax_healpix/YLM_jax_log.py sYLM_ll0_log() lines 29-62
+            // Equation 15 from arXiv:1010.2084
+            using LogTraits = LogArithmeticTraits<C>;
+            C log_prefact = compute_log_prefact_ymm<C>(m);
+            C log_norm = -C(0.5) * LogTraits::log_d(C(4.0) * LogTraits::PI_VAL);
+
             for (int k = k_start; k < k_end; k++) {
                 int global_r = lane + 32 * k;
                 int local_r = global_r - batch_start;
                 C sin_th = C(sh_sin_th[local_r]);
 
-                C Ymm = C(1.0) / Traits::sqrt_d(C(4.0 * Traits::PI_VAL));
-                for (int j = 1; j <= m; j++) {
-                    Ymm *= -sin_th * Traits::sqrt_d(C(2*j + 1) / C(2*j));
-                }
+                // Y[m,m] = (-1)^m * sin(th)^m * prefact / sqrt(4*pi)
+                // log|Y[m,m]| = m * log|sin(th)| + log_prefact + log_norm
+                C log_sin_th = safe_log_typed<C>(sin_th);
+                C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
+                int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);  // (-1)^m
 
-                Ymm_saved[k] = Ymm;  // Save for south pass
-                Ylm_prev1[k] = Ymm;
-                Ylm_prev2[k] = C(0);
+                log_Ymm_saved[k] = log_Ymm;  // Save for south pass
+                sign_Ymm_saved[k] = sign_Ymm;
+                log_Ylm_prev1[k] = log_Ymm;
+                sign_prev1[k] = sign_Ymm;
+                log_Ylm_prev2[k] = LogTraits::LOG_MIN;  // Zero in log-space
+                sign_prev2[k] = 0;
             }
 
             // ================================================================
@@ -1173,41 +1188,71 @@ __global__ void reduce_to_alm_kernel_v6(
             }
             __syncwarp();
 
-            // Process l = m to l_max for north pass
+            // Process l = m to l_max for north pass (LOG-SPACE recurrence)
             for (int l = m; l <= l_max; l++) {
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     sum_re[t] = C(0);
                     sum_im[t] = C(0);
                 }
 
-                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                // Compute log-space recurrence coefficients
+                // Reference: jax_healpix/YLM_jax_log.py lines 66-73
+                C log_recur_C = C(0);
+                C log_recur_A = C(0), log_recur_B = C(0);
                 if (l == m + 1) {
-                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                    // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
+                    log_recur_C = C(0.5) * LogTraits::log_d(C(2*m + 3));
                 } else if (l > m + 1) {
-                    C l2 = C(l * l);
-                    C m2 = C(m * m);
-                    C lm1_2 = C((l-1) * (l-1));
-                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                    log_recur_A = log_A_lm<C>(l, m);
+                    log_recur_B = log_B_lm<C>(l, m);
                 }
 
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
                     int local_r = global_r - batch_start;
                     C cos_th = C(sh_cos_th[local_r]);
-                    C Ylm;
+                    C log_cos_th = safe_log_typed<C>(cos_th);
+                    int8_t sign_cos_th = (cos_th >= C(0)) ? int8_t(1) : int8_t(-1);
+
+                    C log_Ylm;
+                    int8_t sign_Ylm;
 
                     if (l == m) {
-                        Ylm = Ylm_prev1[k];
+                        // Use stored Y[m,m]
+                        log_Ylm = log_Ylm_prev1[k];
+                        sign_Ylm = sign_prev1[k];
                     } else if (l == m + 1) {
-                        Ylm = cos_th * recur_C * Ylm_prev1[k];
-                        Ylm_prev2[k] = Ylm_prev1[k];
-                        Ylm_prev1[k] = Ylm;
+                        // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
+                        // log|Y[m+1,m]| = log|cos_th| + log_recur_C + log|Y[m,m]|
+                        log_Ylm = log_cos_th + log_recur_C + log_Ylm_prev1[k];
+                        sign_Ylm = sign_cos_th * sign_prev1[k];
+
+                        // Update recurrence state
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
                     } else {
-                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
-                        Ylm_prev2[k] = Ylm_prev1[k];
-                        Ylm_prev1[k] = Ylm;
+                        // Y[l,m] = A*cos_th*Y[l-1,m] - B*Y[l-2,m]
+                        // Use logsumexp: R1 = log(A*|cos|*|Y[l-1]|), S1 = sign(cos)*sign[l-1]
+                        //               R2 = log(B*|Y[l-2]|), S2 = -sign[l-2]
+                        C R1 = log_recur_A + log_cos_th + log_Ylm_prev1[k];
+                        int8_t S1 = sign_cos_th * sign_prev1[k];
+                        C R2 = log_recur_B + log_Ylm_prev2[k];
+                        int8_t S2 = -sign_prev2[k];  // Negative due to subtraction
+
+                        logsumexp_typed<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+
+                        // Update recurrence state
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
                     }
+
+                    // Convert to LINEAR only here for Gm multiplication
+                    // This matches JAX approach (line 251 of YLM_jax_log.py)
+                    C Ylm = sign_Ylm * LogTraits::exp_d(clamp_log_typed<C>(log_Ylm));
 
                     for (int t = 0; t < n_maps_in_batch; t++) {
                         R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
@@ -1248,10 +1293,12 @@ __global__ void reduce_to_alm_kernel_v6(
             // ================================================================
             // SOUTH PASS: Restore Ylm, load Gm_south, accumulate with sign
             // ================================================================
-            // Restore Ylm state
+            // Restore Ylm log-space state
             for (int k = k_start; k < k_end; k++) {
-                Ylm_prev1[k] = Ymm_saved[k];
-                Ylm_prev2[k] = C(0);
+                log_Ylm_prev1[k] = log_Ymm_saved[k];
+                sign_prev1[k] = sign_Ymm_saved[k];
+                log_Ylm_prev2[k] = LogTraits::LOG_MIN;  // Zero in log-space
+                sign_prev2[k] = 0;
             }
 
             // Load Gm_south (reusing same shared memory)
@@ -1268,52 +1315,70 @@ __global__ void reduce_to_alm_kernel_v6(
             }
             __syncwarp();
 
-            // Process l = m to l_max for south pass
+            // Process l = m to l_max for south pass (LOG-SPACE recurrence)
             for (int l = m; l <= l_max; l++) {
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     sum_re[t] = C(0);
                     sum_im[t] = C(0);
                 }
 
-                C recur_A = C(0), recur_B = C(0), recur_C = C(0);
+                // Compute log-space recurrence coefficients
+                C log_recur_C = C(0);
+                C log_recur_A = C(0), log_recur_B = C(0);
                 if (l == m + 1) {
-                    recur_C = Traits::sqrt_d(C(2*m + 3));
+                    log_recur_C = C(0.5) * LogTraits::log_d(C(2*m + 3));
                 } else if (l > m + 1) {
-                    C l2 = C(l * l);
-                    C m2 = C(m * m);
-                    C lm1_2 = C((l-1) * (l-1));
-                    recur_A = Traits::sqrt_d((C(4)*l2 - C(1)) / (l2 - m2));
-                    recur_B = Traits::sqrt_d((C(2*l + 1)) / (C(2*l - 3)) * (lm1_2 - m2) / (l2 - m2));
+                    log_recur_A = log_A_lm<C>(l, m);
+                    log_recur_B = log_B_lm<C>(l, m);
                 }
 
                 // Sign for south: +1 if (l+m) even, -1 if odd
-                C sign = ((l + m) & 1) ? C(-1) : C(1);
+                C parity_sign = ((l + m) & 1) ? C(-1) : C(1);
 
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * k;
                     int local_r = global_r - batch_start;
                     C cos_th = C(sh_cos_th[local_r]);
-                    C Ylm;
+                    C log_cos_th = safe_log_typed<C>(cos_th);
+                    int8_t sign_cos_th = (cos_th >= C(0)) ? int8_t(1) : int8_t(-1);
+
+                    C log_Ylm;
+                    int8_t sign_Ylm;
 
                     if (l == m) {
-                        Ylm = Ylm_prev1[k];
+                        log_Ylm = log_Ylm_prev1[k];
+                        sign_Ylm = sign_prev1[k];
                     } else if (l == m + 1) {
-                        Ylm = cos_th * recur_C * Ylm_prev1[k];
-                        Ylm_prev2[k] = Ylm_prev1[k];
-                        Ylm_prev1[k] = Ylm;
+                        log_Ylm = log_cos_th + log_recur_C + log_Ylm_prev1[k];
+                        sign_Ylm = sign_cos_th * sign_prev1[k];
+
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
                     } else {
-                        Ylm = recur_A * cos_th * Ylm_prev1[k] - recur_B * Ylm_prev2[k];
-                        Ylm_prev2[k] = Ylm_prev1[k];
-                        Ylm_prev1[k] = Ylm;
+                        C R1 = log_recur_A + log_cos_th + log_Ylm_prev1[k];
+                        int8_t S1 = sign_cos_th * sign_prev1[k];
+                        C R2 = log_recur_B + log_Ylm_prev2[k];
+                        int8_t S2 = -sign_prev2[k];
+
+                        logsumexp_typed<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
                     }
+
+                    // Convert to LINEAR with parity sign for south hemisphere
+                    C Ylm = parity_sign * sign_Ylm * LogTraits::exp_d(clamp_log_typed<C>(log_Ylm));
 
                     for (int t = 0; t < n_maps_in_batch; t++) {
                         R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
                         C gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
                         C gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
-                        // South contribution with parity sign
-                        sum_re[t] += sign * Ylm * gm_re;
-                        sum_im[t] += sign * Ylm * gm_im;
+                        sum_re[t] += Ylm * gm_re;
+                        sum_im[t] += Ylm * gm_im;
                     }
                 }
 
