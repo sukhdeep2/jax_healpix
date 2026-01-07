@@ -71,6 +71,8 @@ CORE_SOURCES=(
     "map2alm_v6.cu"    # Optimal warp-per-m, NO atomics
     "alm2map_v6.cu"    # Optimal warp-per-m synthesis (matching map2alm_v6)
     "alm2cl.cu"        # Power spectrum computation
+    "beam_alm_ops.cu"  # Beam/alm operations: gauss_beam, smoothalm, almxfl, pixwin, resize_alm
+    "synalm.cu"        # Random alm generation from power spectrum
     "spht_api.cu"
 )
 

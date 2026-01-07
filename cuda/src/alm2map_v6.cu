@@ -20,26 +20,11 @@
 #include <cuda_bf16.h>
 #include <cufft.h>
 #include "../include/spht_types.h"
+#include "../include/spht_transform_config.cuh"
 #include "../include/bluestein_fft.h"
 #include "../include/log_arithmetic.cuh"
 #include <stdio.h>
 #include <type_traits>
-
-// ============================================================================
-// Runtime Phase 1 method selection (defined in map2alm_v6.cu)
-// ============================================================================
-
-enum class Phase1Method {
-    DFT = 0,
-    FFT_EQUATORIAL = 1,
-    BLUESTEIN = 2
-};
-
-// External reference to global flag from map2alm_v6.cu
-extern Phase1Method g_phase1_method;
-
-// Legacy constant for backwards compatibility (used by non-templated code)
-#define MAX_RINGS_PER_LANE 64
 
 // Ring batch size for Phase 1 (undef to override default from spht_types.h)
 #undef RING_BATCH_SIZE

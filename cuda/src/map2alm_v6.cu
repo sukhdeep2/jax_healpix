@@ -19,140 +19,24 @@
 #include <cuda_bf16.h>
 #include <cufft.h>
 #include "../include/spht_types.h"
+#include "../include/spht_transform_config.cuh"
 #include "../include/log_arithmetic.cuh"
+#include "../include/bluestein_fft.h"
 #include <stdio.h>
 #include <type_traits>
-
-// ============================================================================
-// Runtime configuration for Phase 1 method
-// ============================================================================
-
-enum class Phase1Method {
-    DFT = 0,           // Direct DFT for all rings (default, simple, good for small nside)
-    FFT_EQUATORIAL = 1, // FFT for equatorial rings, DFT for polar (hybrid)
-    BLUESTEIN = 2       // Bluestein FFT for all rings (cuHPX-style)
-};
-
-// Global configuration - can be changed at runtime (used by both map2alm and alm2map)
-Phase1Method g_phase1_method = Phase1Method::DFT;
-
-// ============================================================================
-// cuFFT Plan Cache for Bluestein FFT
-// ============================================================================
-
 #include <map>
 #include <mutex>
 
-struct CufftPlanKey {
-    int fft_size;
-    int batch;
-    cufftType type;  // CUFFT_Z2Z or CUFFT_C2C
+// ============================================================================
+// Global Phase1 Method (definition - declared in spht_transform_config.cuh)
+// ============================================================================
 
-    bool operator<(const CufftPlanKey& other) const {
-        if (fft_size != other.fft_size) return fft_size < other.fft_size;
-        if (batch != other.batch) return batch < other.batch;
-        return type < other.type;
-    }
-};
+Phase1Method g_phase1_method = Phase1Method::DFT;
 
-static std::map<CufftPlanKey, cufftHandle> g_cufft_plan_cache;
-static std::mutex g_plan_cache_mutex;
-
-// Get or create a cached cuFFT plan
-static cufftHandle get_cached_plan(int fft_size, int batch, cufftType type) {
-    CufftPlanKey key = {fft_size, batch, type};
-
-    std::lock_guard<std::mutex> lock(g_plan_cache_mutex);
-    auto it = g_cufft_plan_cache.find(key);
-    if (it != g_cufft_plan_cache.end()) {
-        return it->second;
-    }
-
-    // Create new plan
-    cufftHandle plan;
-    cufftResult result = cufftPlan1d(&plan, fft_size, type, batch);
-    if (result != CUFFT_SUCCESS) {
-        fprintf(stderr, "cuFFT plan creation failed: %d\n", result);
-        return 0;
-    }
-
-    g_cufft_plan_cache[key] = plan;
-    return plan;
-}
-
-// Helper to get next power of 2 (defined in bluestein_fft.h)
-#include "../include/bluestein_fft.h"
-
-// Maximum rings per lane for template instantiations
-// Supported sizes: 16, 32, 64, 128
-// - 16: nside <= 256 (512 rings / 32 = 16)
-// - 32: nside <= 512 (1024 rings / 32 = 32)
-// - 64: nside <= 1024 (2048 rings / 32 = 64)
-// - 128: nside <= 2048 (4096 rings / 32 = 128)
-// For larger nside, multi-pass processing is used
-
-// Memory budget per thread to avoid register spilling (~1.5KB)
-// Per ring: 4*sizeof(C) + 4*sizeof(int8_t) = 20 bytes (f32) or 36 bytes (f64)
-// Per map: 2*sizeof(C) = 8 bytes (f32) or 16 bytes (f64)
-constexpr int MEMORY_BUDGET_BYTES = 1400;
-constexpr int OVERHEAD_BYTES = 200;
-
-// Legacy constant for spin-2 kernel (TODO: update spin-2 to use templates)
-#define MAX_RINGS_PER_LANE 64
-
-// Kernel configuration for dynamic dispatch
-struct KernelConfig {
-    int rings_per_lane;     // Template parameter to use (16, 32, 64, or 128)
-    int n_ring_passes;      // Number of passes to cover all rings
-    int maps_per_launch;    // Maps processed per kernel launch
-    int n_map_launches;     // Number of kernel launches for all maps
-};
-
-// Calculate optimal kernel configuration based on runtime parameters
-// spin: 0 for spin-0 (log-space Ylm), 2 for spin-2 (linear Ylm)
-template<typename R>
-KernelConfig calculate_kernel_config(int nside, int n_maps, int spin = 0) {
-    int per_ring, per_map;
-
-    if (spin == 0) {
-        // Spin-0 log-space: 4 arrays of R + 4 arrays of int8_t per ring
-        per_ring = 4 * sizeof(R) + 4;
-        // 2 accumulators per map (sum_re, sum_im)
-        per_map = 2 * sizeof(R);
-    } else {
-        // Spin-2 linear: 4 arrays of R per ring (Ylm_prev1, prev2, saved1, saved2)
-        per_ring = 4 * sizeof(R);
-        // 4 accumulators per map (sum_E_re, sum_E_im, sum_B_re, sum_B_im)
-        per_map = 4 * sizeof(R);
-    }
-
-    int maps_per_launch = n_maps;
-    int available = MEMORY_BUDGET_BYTES - OVERHEAD_BYTES - per_map * maps_per_launch;
-    int max_rings_per_lane = available / per_ring;
-
-    // If max_rings_per_lane < 1, reduce maps until it fits
-    while (max_rings_per_lane < 1 && maps_per_launch > 1) {
-        maps_per_launch--;
-        available = MEMORY_BUDGET_BYTES - OVERHEAD_BYTES - per_map * maps_per_launch;
-        max_rings_per_lane = available / per_ring;
-        fprintf(stderr, "Warning: Reducing maps_per_launch to %d to fit memory budget (spin=%d)\n",
-                maps_per_launch, spin);
-    }
-
-    // Select template size (must be power of 2, pick smallest that fits)
-    int template_size;
-    if (max_rings_per_lane >= 128) template_size = 128;
-    else if (max_rings_per_lane >= 64) template_size = 64;
-    else if (max_rings_per_lane >= 32) template_size = 32;
-    else template_size = 16;
-
-    // Calculate rings needed and passes required
-    int n_north_rings = 2 * nside;
-    int rings_needed_per_lane = (n_north_rings + 31) / 32;
-    int n_ring_passes = (rings_needed_per_lane + template_size - 1) / template_size;
-    int n_map_launches = (n_maps + maps_per_launch - 1) / maps_per_launch;
-
-    return {template_size, n_ring_passes, maps_per_launch, n_map_launches};
+// cuFFT plan cache is defined in bluestein_core.cu, use the shared function
+// get_cached_cufft_plan() declared in spht_transform_config.cuh
+static inline cufftHandle get_cached_plan(int fft_size, int batch, cufftType type) {
+    return get_cached_cufft_plan(fft_size, batch, type);
 }
 
 // ============================================================================
