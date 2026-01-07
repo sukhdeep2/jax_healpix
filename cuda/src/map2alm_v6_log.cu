@@ -343,14 +343,15 @@ __global__ void reduce_to_alm_log_kernel_v2(
             }
             __syncwarp();
 
-            // Determine this lane's rings
-            int rings_per_lane = (batch_size + 31) / 32;
-            int my_ring_count = min(rings_per_lane, LOG_RINGS_PER_LANE);
+            // Pre-compute exact k bounds to avoid warp divergence
+            // Each lane handles rings: lane, lane+32, lane+64, ...
+            // In this batch, we need rings from 0 to batch_size-1
+            int k_end = (batch_size > lane) ? (batch_size - 1 - lane) / 32 + 1 : 0;
+            k_end = min(k_end, LOG_RINGS_PER_LANE);
 
             // Initialize Ymm for rings in this batch (ONCE per batch)
-            for (int k = 0; k < my_ring_count; k++) {
+            for (int k = 0; k < k_end; k++) {
                 int local_r = lane + 32 * k;
-                if (local_r >= batch_size) break;
 
                 C sin_th = C(sh_sin_th[local_r]);
                 C cos_th = C(sh_cos_th[local_r]);
@@ -374,10 +375,9 @@ __global__ void reduce_to_alm_log_kernel_v2(
                 LogAlmAccumulator<C> lane_acc;
                 lane_acc.reset();
 
-                // Process all rings for this lane
-                for (int k = 0; k < my_ring_count; k++) {
+                // Process all rings for this lane (k_end pre-computed above)
+                for (int k = 0; k < k_end; k++) {
                     int local_r = lane + 32 * k;
-                    if (local_r >= batch_size) break;
                     int global_r = batch_start + local_r;
 
                     C log_Ylm;
