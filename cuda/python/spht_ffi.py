@@ -14,52 +14,93 @@ from pathlib import Path
 # Configuration (JAX-style precision flags)
 # ============================================================================
 
+# Valid precision options
+VALID_STORAGE_PRECISIONS = ("float64", "float32", "bfloat16")
+VALID_RECURRENCE_PRECISIONS = ("float64", "float32", "bfloat16")
+VALID_ACCUMULATION_MODES = ("linear", "log")
+
+
 class _SPHTConfig:
     """Global configuration for SPHT CUDA precision settings."""
 
     def __init__(self):
         self._storage_precision = "float64"
         self._recurrence_precision = "float64"
+        self._accumulation_mode = "linear"
 
     @property
     def storage_precision(self) -> str:
-        """Precision for map/alm storage: 'float64' or 'float32'"""
+        """Precision for map/alm storage: 'float64', 'float32', or 'bfloat16'"""
         return self._storage_precision
 
     @property
     def recurrence_precision(self) -> str:
-        """Precision for Ylm recurrence: 'float64' or 'float32'"""
+        """Precision for Ylm recurrence: 'float64', 'float32', or 'bfloat16'"""
         return self._recurrence_precision
+
+    @property
+    def accumulation_mode(self) -> str:
+        """Accumulation mode: 'linear' (fast FMA) or 'log' (logsumexp)"""
+        return self._accumulation_mode
 
     def update(self, key: str, value):
         """Update a configuration value."""
         if key == "spht_storage_precision":
-            if value not in ("float64", "float32"):
-                raise ValueError(f"storage_precision must be 'float64' or 'float32', got {value}")
+            if value not in VALID_STORAGE_PRECISIONS:
+                raise ValueError(f"storage_precision must be one of {VALID_STORAGE_PRECISIONS}, got {value}")
             self._storage_precision = value
+            # bf16 requires log accumulation
+            if value == "bfloat16" and self._accumulation_mode == "linear":
+                self._accumulation_mode = "log"
         elif key == "spht_recurrence_precision":
-            if value not in ("float64", "float32"):
-                raise ValueError(f"recurrence_precision must be 'float64' or 'float32', got {value}")
+            if value not in VALID_RECURRENCE_PRECISIONS:
+                raise ValueError(f"recurrence_precision must be one of {VALID_RECURRENCE_PRECISIONS}, got {value}")
             self._recurrence_precision = value
+            # bf16 requires log accumulation
+            if value == "bfloat16" and self._accumulation_mode == "linear":
+                self._accumulation_mode = "log"
+        elif key == "spht_accumulation_mode":
+            if value not in VALID_ACCUMULATION_MODES:
+                raise ValueError(f"accumulation_mode must be one of {VALID_ACCUMULATION_MODES}, got {value}")
+            # Cannot use linear with bf16
+            if value == "linear" and (self._storage_precision == "bfloat16" or
+                                       self._recurrence_precision == "bfloat16"):
+                raise ValueError("accumulation_mode='linear' not supported with bfloat16 precision")
+            self._accumulation_mode = value
         else:
             raise KeyError(f"Unknown config key: {key}")
+
+    def get_effective_accumulation_mode(self) -> str:
+        """Get the effective accumulation mode (may be forced by precision)."""
+        # bf16 always requires log mode
+        if self._storage_precision == "bfloat16" or self._recurrence_precision == "bfloat16":
+            return "log"
+        return self._accumulation_mode
 
 
 # Global config instance
 config = _SPHTConfig()
 
 
-def set_precision(storage: str = None, recurrence: str = None):
+def set_precision(storage: str = None, recurrence: str = None, accumulation: str = None):
     """Set precision for SPHT CUDA computations.
 
     Args:
-        storage: Precision for map/alm data - 'float64' or 'float32'
-        recurrence: Precision for Ylm recurrence - 'float64' or 'float32'
+        storage: Precision for map/alm data - 'float64', 'float32', or 'bfloat16'
+        recurrence: Precision for Ylm recurrence - 'float64', 'float32', or 'bfloat16'
+        accumulation: Accumulation mode - 'linear' (fast, default) or 'log' (numerically stable)
+
+    Note:
+        - bfloat16 requires accumulation='log' (set automatically)
+        - 'linear' mode uses fast FMA-based accumulation
+        - 'log' mode uses logsumexp (5-10x slower but handles extreme dynamic range)
     """
     if storage is not None:
         config.update("spht_storage_precision", storage)
     if recurrence is not None:
         config.update("spht_recurrence_precision", recurrence)
+    if accumulation is not None:
+        config.update("spht_accumulation_mode", accumulation)
 
 
 # ============================================================================
@@ -245,6 +286,16 @@ def _setup_functions(lib):
     lib.alm2map_cuda_v6_spin2_f32_f64.restype = None
     lib.alm2map_cuda_v6_spin2_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
     lib.alm2map_cuda_v6_spin2_f32_f32.restype = None
+
+    # ========== map2alm LOG mode functions ==========
+    lib.map2alm_cuda_v6_log_f64_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f64_f64.restype = None
+    lib.map2alm_cuda_v6_log_f64_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f64_f32.restype = None
+    lib.map2alm_cuda_v6_log_f32_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f32_f64.restype = None
+    lib.map2alm_cuda_v6_log_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f32_f32.restype = None
 
     # ========== Phase 1 method control ==========
     lib.set_phase1_method.argtypes = [c_int]

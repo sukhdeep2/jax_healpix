@@ -16,12 +16,16 @@ import os
 # Configuration (JAX-style precision flags)
 # ============================================================================
 
+VALID_ACCUMULATION_MODES = ("linear", "log")
+
+
 class _SPHTConfig:
     """Global configuration for SPHT CUDA precision settings."""
 
     def __init__(self):
         self._storage_precision = "float64"
         self._recurrence_precision = "float64"
+        self._accumulation_mode = "linear"
 
     @property
     def storage_precision(self) -> str:
@@ -33,21 +37,47 @@ class _SPHTConfig:
         """Precision for Ylm recurrence: 'float64' or 'float32'"""
         return self._recurrence_precision
 
+    @property
+    def accumulation_mode(self) -> str:
+        """Accumulation mode: 'linear' (fast FMA) or 'log' (logsumexp)"""
+        return self._accumulation_mode
+
+    def get_effective_accumulation_mode(self) -> str:
+        """Get the effective accumulation mode (may be forced by precision)."""
+        # bf16 always requires log mode
+        if self._storage_precision == "bfloat16" or self._recurrence_precision == "bfloat16":
+            return "log"
+        return self._accumulation_mode
+
     def update(self, key: str, value):
         """Update a configuration value.
 
         Args:
-            key: One of 'spht_storage_precision' or 'spht_recurrence_precision'
-            value: 'float64' or 'float32'
+            key: One of 'spht_storage_precision', 'spht_recurrence_precision', or 'spht_accumulation_mode'
+            value: 'float64', 'float32', 'bfloat16', 'linear', or 'log'
         """
         if key == "spht_storage_precision":
-            if value not in ("float64", "float32"):
-                raise ValueError(f"storage_precision must be 'float64' or 'float32', got {value}")
+            if value not in ("float64", "float32", "bfloat16"):
+                raise ValueError(f"storage_precision must be 'float64', 'float32', or 'bfloat16', got {value}")
             self._storage_precision = value
+            # bf16 requires log accumulation
+            if value == "bfloat16" and self._accumulation_mode == "linear":
+                self._accumulation_mode = "log"
         elif key == "spht_recurrence_precision":
-            if value not in ("float64", "float32"):
-                raise ValueError(f"recurrence_precision must be 'float64' or 'float32', got {value}")
+            if value not in ("float64", "float32", "bfloat16"):
+                raise ValueError(f"recurrence_precision must be 'float64', 'float32', or 'bfloat16', got {value}")
             self._recurrence_precision = value
+            # bf16 requires log accumulation
+            if value == "bfloat16" and self._accumulation_mode == "linear":
+                self._accumulation_mode = "log"
+        elif key == "spht_accumulation_mode":
+            if value not in VALID_ACCUMULATION_MODES:
+                raise ValueError(f"accumulation_mode must be one of {VALID_ACCUMULATION_MODES}, got {value}")
+            # Cannot use linear with bf16
+            if value == "linear" and (self._storage_precision == "bfloat16" or
+                                       self._recurrence_precision == "bfloat16"):
+                raise ValueError("accumulation_mode='linear' not supported with bfloat16 precision")
+            self._accumulation_mode = value
         else:
             raise KeyError(f"Unknown config key: {key}")
 
@@ -56,14 +86,20 @@ class _SPHTConfig:
 config = _SPHTConfig()
 
 
-def set_precision(storage: str = None, recurrence: str = None):
+def set_precision(storage: str = None, recurrence: str = None, accumulation: str = None):
     """Set precision for SPHT CUDA computations.
 
     Similar to jax.config.update("jax_enable_x64", True).
 
     Args:
-        storage: Precision for map/alm data - 'float64' or 'float32'
-        recurrence: Precision for Ylm recurrence - 'float64' or 'float32'
+        storage: Precision for map/alm data - 'float64', 'float32', or 'bfloat16'
+        recurrence: Precision for Ylm recurrence - 'float64', 'float32', or 'bfloat16'
+        accumulation: Accumulation mode - 'linear' (fast, default) or 'log' (numerically stable)
+
+    Note:
+        - bfloat16 requires accumulation='log' (set automatically)
+        - 'linear' mode uses fast FMA-based accumulation
+        - 'log' mode uses logsumexp (5-10x slower but handles extreme dynamic range)
 
     Examples:
         # Full float64 (default, highest accuracy)
@@ -74,11 +110,16 @@ def set_precision(storage: str = None, recurrence: str = None):
 
         # Mixed: float32 storage with float64 recurrence (balanced)
         set_precision(storage="float32", recurrence="float64")
+
+        # LOG mode for extreme dynamic range
+        set_precision(storage="float64", recurrence="float64", accumulation="log")
     """
     if storage is not None:
         config.update("spht_storage_precision", storage)
     if recurrence is not None:
         config.update("spht_recurrence_precision", recurrence)
+    if accumulation is not None:
+        config.update("spht_accumulation_mode", accumulation)
 
 
 # Type definitions matching CUDA types
@@ -273,6 +314,19 @@ def _setup_functions(lib):
     lib.alm2map_cuda_v6_spin2_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p]
     lib.alm2map_cuda_v6_spin2_f32_f32.restype = None
 
+    # ========== V6 LOG mode: map2alm with logsumexp accumulation ==========
+    lib.map2alm_cuda_v6_log_f64_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f64_f64.restype = None
+
+    lib.map2alm_cuda_v6_log_f64_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f64_f32.restype = None
+
+    lib.map2alm_cuda_v6_log_f32_f64.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f32_f64.restype = None
+
+    lib.map2alm_cuda_v6_log_f32_f32.argtypes = [c_int, c_int, c_int, c_void_p, c_void_p, c_void_p]
+    lib.map2alm_cuda_v6_log_f32_f32.restype = None
+
     # Memory allocation (float64)
     lib.spht_allocate_map.argtypes = [c_int, c_int]
     lib.spht_allocate_map.restype = c_void_p
@@ -439,7 +493,8 @@ class SPHTCuda:
     """CUDA-accelerated Spherical Harmonic Transforms on HEALPix grid."""
 
     def __init__(self, nside: int, l_max: int = None, version: str = "v5",
-                 storage_precision: str = None, recurrence_precision: str = None):
+                 storage_precision: str = None, recurrence_precision: str = None,
+                 accumulation_mode: str = None):
         """
         Initialize SPHT CUDA context.
 
@@ -457,6 +512,8 @@ class SPHTCuda:
                                If None, uses global config.storage_precision
             recurrence_precision: Precision for Ylm recurrence - 'float64' or 'float32'
                                   If None, uses global config.recurrence_precision
+            accumulation_mode: Accumulation mode - 'linear' (fast) or 'log' (numerically stable)
+                               If None, uses global config. bf16 precision forces 'log'.
         """
         self.nside = nside
         self.l_max = l_max if l_max is not None else 3 * nside
@@ -465,6 +522,7 @@ class SPHTCuda:
         # Use provided precision or fall back to global config
         self.storage_precision = storage_precision or config.storage_precision
         self.recurrence_precision = recurrence_precision or config.recurrence_precision
+        self.accumulation_mode = accumulation_mode or config.get_effective_accumulation_mode()
         self._lib = _get_lib()
 
     def map2alm(self, maps: dict, spins: tuple = (0,), return_split: bool = False) -> dict:
@@ -549,6 +607,7 @@ class SPHTCuda:
 
         use_f32 = (self.storage_precision == "float32")
         use_f32_recur = (self.recurrence_precision == "float32")
+        use_log_mode = (self.accumulation_mode == "log")
         lp1 = self.l_max + 1
 
         if timing_enabled:
@@ -589,25 +648,47 @@ class SPHTCuda:
         if timing_enabled:
             t_h2d = time.perf_counter()
 
-        # Select kernel based on precision combination
-        if use_f32:
-            if use_f32_recur:
-                self._lib.map2alm_cuda_v6_f32_f32(
-                    self.nside, self.l_max, n_maps,
-                    d_map, d_alm_real, d_alm_imag)
+        # Select kernel based on precision combination and accumulation mode
+        if use_log_mode:
+            # LOG mode (logsumexp accumulation)
+            if use_f32:
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_log_f32_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_log_f32_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
             else:
-                self._lib.map2alm_cuda_v6_f32_f64(
-                    self.nside, self.l_max, n_maps,
-                    d_map, d_alm_real, d_alm_imag)
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_log_f64_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_log_f64_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
         else:
-            if use_f32_recur:
-                self._lib.map2alm_cuda_v6_f64_f32(
-                    self.nside, self.l_max, n_maps,
-                    d_map, d_alm_real, d_alm_imag)
+            # LINEAR mode (FMA accumulation - default)
+            if use_f32:
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_f32_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_f32_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
             else:
-                self._lib.map2alm_cuda_v6_f64_f64(
-                    self.nside, self.l_max, n_maps,
-                    d_map, d_alm_real, d_alm_imag)
+                if use_f32_recur:
+                    self._lib.map2alm_cuda_v6_f64_f32(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
+                else:
+                    self._lib.map2alm_cuda_v6_f64_f64(
+                        self.nside, self.l_max, n_maps,
+                        d_map, d_alm_real, d_alm_imag)
 
         if timing_enabled:
             t_kernel = time.perf_counter()

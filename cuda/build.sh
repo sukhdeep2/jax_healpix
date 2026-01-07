@@ -68,11 +68,13 @@ BLUESTEIN_SOURCES=(
 # Core transform sources
 CORE_SOURCES=(
     "ylm_recurrence.cu"
-    "map2alm_v6.cu"    # Optimal warp-per-m, NO atomics
-    "alm2map_v6.cu"    # Optimal warp-per-m synthesis (matching map2alm_v6)
-    "alm2cl.cu"        # Power spectrum computation
-    "beam_alm_ops.cu"  # Beam/alm operations: gauss_beam, smoothalm, almxfl, pixwin, resize_alm
-    "synalm.cu"        # Random alm generation from power spectrum
+    "map2alm_v6.cu"        # Optimal warp-per-m, NO atomics (LINEAR mode)
+    "alm2map_v6.cu"        # Optimal warp-per-m synthesis (LINEAR mode)
+    "map2alm_v6_log.cu"    # LOG accumulation mode for map2alm
+    "alm2map_v6_log.cu"    # LOG accumulation mode for alm2map
+    "alm2cl.cu"            # Power spectrum computation
+    "beam_alm_ops.cu"      # Beam/alm operations
+    "synalm.cu"            # Random alm generation from power spectrum
     "spht_api.cu"
 )
 
@@ -117,6 +119,12 @@ ${NVCC} ${NVCC_FLAGS} ${ARCH_FLAGS} -o "${BUILD_DIR}/test_transforms" \
     "${SCRIPT_DIR}/tests/test_transforms.cu" \
     -L"${BUILD_DIR}" -lspht_cuda -Xlinker -rpath,"${BUILD_DIR}"
 
+# Build test_logspace
+echo "Compiling test_logspace.cu..."
+${NVCC} ${NVCC_FLAGS} ${ARCH_FLAGS} -o "${BUILD_DIR}/test_logspace" \
+    "${SCRIPT_DIR}/tests/test_logspace.cu" \
+    -lcudart
+
 echo ""
 echo "Build complete!"
 echo ""
@@ -124,7 +132,9 @@ echo "Library: ${BUILD_DIR}/libspht_cuda.so"
 echo "Tests:"
 echo "  ${BUILD_DIR}/test_ylm"
 echo "  ${BUILD_DIR}/test_transforms"
+echo "  ${BUILD_DIR}/test_logspace"
 echo ""
 echo "Run tests with:"
 echo "  ${BUILD_DIR}/test_ylm"
 echo "  ${BUILD_DIR}/test_transforms"
+echo "  ${BUILD_DIR}/test_logspace"

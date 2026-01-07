@@ -5,6 +5,48 @@
 #include <stdint.h>
 #include <math.h>
 
+// bf16 support (requires sm_80+ / Ampere)
+#if defined(__CUDACC__)
+#include <cuda_bf16.h>
+#define SPHT_HAS_BF16_HEADER 1
+#else
+#define SPHT_HAS_BF16_HEADER 0
+#endif
+
+// ============================================================================
+// Precision and Accumulation Mode Enums
+// ============================================================================
+
+/**
+ * Storage/recurrence precision options
+ */
+typedef enum {
+    SPHT_PRECISION_F64 = 0,    // float64 (double)
+    SPHT_PRECISION_F32 = 1,    // float32 (float)
+    SPHT_PRECISION_BF16 = 2    // bfloat16 (requires sm_80+)
+} spht_precision_t;
+
+/**
+ * Accumulation mode for Phase 2 (Ylm + sum)
+ *
+ * LINEAR: Fast FMA-based accumulation (default for f32/f64)
+ *         - Uses standard multiply-accumulate
+ *         - Best performance, may overflow for extreme dynamic range
+ *
+ * LOG: Log-space logsumexp accumulation (required for bf16)
+ *      - Uses logsumexp for numerically stable sum
+ *      - ~5-10x slower than LINEAR
+ *      - Handles extreme dynamic range without overflow
+ */
+typedef enum {
+    SPHT_ACCUM_LINEAR = 0,     // Fast FMA path (default)
+    SPHT_ACCUM_LOG = 1         // Log-space path (required for bf16)
+} spht_accumulation_mode_t;
+
+// ============================================================================
+// Default type (for backward compatibility)
+// ============================================================================
+
 // CRITICAL: Must use double precision throughout for accuracy
 typedef double real_t;
 
@@ -98,5 +140,56 @@ typedef struct {
 
 // Helper macros for kernel launches
 #define CEILDIV(a, b) (((a) + (b) - 1) / (b))
+
+// ============================================================================
+// bf16 Storage Formats (for memory-efficient log-space storage)
+// ============================================================================
+
+#if SPHT_HAS_BF16_HEADER
+
+/**
+ * LogMapBlock: Packed bf16 storage for real-valued maps
+ *
+ * Stores 16 map values in log-space with packed signs.
+ * Memory: 34 bytes for 16 values = 2.125 bytes/value (vs 4 for f32)
+ */
+typedef struct __align__(32) {
+    __nv_bfloat16 log_abs[16];  // log(|value|), 32 bytes
+    uint16_t signs;              // 1 bit per value, packed
+    uint16_t padding;            // Alignment padding
+} LogMapBlock;
+
+/**
+ * LogAlmBlock: Packed bf16 storage for complex alm coefficients
+ *
+ * Stores 16 complex values in log-Cartesian form with packed signs.
+ * Memory: 68 bytes for 16 complex = 4.25 bytes/complex (vs 8 for complex64)
+ */
+typedef struct __align__(64) {
+    __nv_bfloat16 log_re[16];   // log(|real|), 32 bytes
+    __nv_bfloat16 log_im[16];   // log(|imag|), 32 bytes
+    uint16_t signs_re;           // 1 bit per value
+    uint16_t signs_im;           // 1 bit per value
+} LogAlmBlock;
+
+/**
+ * Helper: Extract sign bit from packed uint16
+ */
+static __device__ __forceinline__ int8_t unpack_sign(uint16_t packed, int idx) {
+    return ((packed >> idx) & 1) ? int8_t(1) : int8_t(-1);
+}
+
+/**
+ * Helper: Pack sign into uint16
+ */
+static __device__ __forceinline__ uint16_t pack_sign(uint16_t packed, int idx, int8_t sign) {
+    if (sign >= 0) {
+        return packed | (uint16_t(1) << idx);
+    } else {
+        return packed & ~(uint16_t(1) << idx);
+    }
+}
+
+#endif // SPHT_HAS_BF16_HEADER
 
 #endif // SPHT_TYPES_H

@@ -2785,3 +2785,40 @@ void map2alm_cuda_v6_spin2_f32(int nside, int l_max, int n_maps,
 }
 
 } // extern "C" for spin-2
+
+// ============================================================================
+// Explicit Template Instantiations for Cross-Translation-Unit Access
+// These allow the LOG mode kernel (map2alm_v6_log.cu) to call the DFT kernel
+// ============================================================================
+
+template __global__ void compute_gm_kernel_v6<double, double>(
+    int nside, int l_max, int n_maps, int n_rings,
+    const double* __restrict__ map_in,
+    double* __restrict__ Gm_north_re, double* __restrict__ Gm_north_im,
+    double* __restrict__ Gm_south_re, double* __restrict__ Gm_south_im,
+    double* __restrict__ cos_theta_out, double* __restrict__ sin_theta_out
+);
+
+template __global__ void compute_gm_kernel_v6<double, float>(
+    int nside, int l_max, int n_maps, int n_rings,
+    const double* __restrict__ map_in,
+    float* __restrict__ Gm_north_re, float* __restrict__ Gm_north_im,
+    float* __restrict__ Gm_south_re, float* __restrict__ Gm_south_im,
+    float* __restrict__ cos_theta_out, float* __restrict__ sin_theta_out
+);
+
+template __global__ void compute_gm_kernel_v6<float, double>(
+    int nside, int l_max, int n_maps, int n_rings,
+    const float* __restrict__ map_in,
+    double* __restrict__ Gm_north_re, double* __restrict__ Gm_north_im,
+    double* __restrict__ Gm_south_re, double* __restrict__ Gm_south_im,
+    double* __restrict__ cos_theta_out, double* __restrict__ sin_theta_out
+);
+
+template __global__ void compute_gm_kernel_v6<float, float>(
+    int nside, int l_max, int n_maps, int n_rings,
+    const float* __restrict__ map_in,
+    float* __restrict__ Gm_north_re, float* __restrict__ Gm_north_im,
+    float* __restrict__ Gm_south_re, float* __restrict__ Gm_south_im,
+    float* __restrict__ cos_theta_out, float* __restrict__ sin_theta_out
+);

@@ -310,6 +310,7 @@ __global__ void compute_fmy_kernel_v6(
     int nside, int l_max, int n_maps, int n_north_rings,
     int ring_batch_size,
     int ring_pass, int total_ring_passes,  // Multi-pass ring processing
+    int tile_size,  // L-tiling: 0 means no tiling (use lp1), >0 means tile size
     const T* __restrict__ alm_real,  // [n_maps, lp1, lp1]
     const T* __restrict__ alm_imag,
     R* __restrict__ Fmy_even_re,     // [n_maps, lp1, n_north_rings]
@@ -329,19 +330,23 @@ __global__ void compute_fmy_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
+    // Effective tile size: 0 means full lp1 (no tiling)
+    int eff_tile_size = (tile_size > 0) ? tile_size : lp1;
+
     // Precompute m-dependent values (used throughout kernel)
     C m2_precomp = C(m * m);
     C recur_c_m1 = Traits::sqrt_d(C(2*m + 3));  // For l = m+1 recurrence
 
-    // Shared memory layout depends on USE_PRECOMPUTED_COEFF
+    // Shared memory layout - alm arrays use tile_size when tiling
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
     T* sh_alm_re = (T*)(sh_sin_th + ring_batch_size);
-    T* sh_alm_im = sh_alm_re + lp1;
-    // Precomputed recurrence coefficients (only if USE_PRECOMPUTED_COEFF)
-    C* sh_log_A = USE_PRECOMPUTED_COEFF ? (C*)(sh_alm_im + lp1) : nullptr;
-    C* sh_log_B = USE_PRECOMPUTED_COEFF ? (sh_log_A + lp1) : nullptr;
+    T* sh_alm_im = sh_alm_re + eff_tile_size;
+    // Precomputed recurrence coefficients (only if USE_PRECOMPUTED_COEFF and not tiling)
+    // When tiling, we always compute coefficients on the fly
+    C* sh_log_A = (USE_PRECOMPUTED_COEFF && tile_size == 0) ? (C*)(sh_alm_im + eff_tile_size) : nullptr;
+    C* sh_log_B = (USE_PRECOMPUTED_COEFF && tile_size == 0) ? (sh_log_A + lp1) : nullptr;
 
     // Per-lane Ylm recurrence state in LOG-SPACE
     // We store log(|Ylm|) and sign separately for numerical stability
@@ -371,8 +376,8 @@ __global__ void compute_fmy_kernel_v6(
     int k_offset = ring_pass * RINGS_PER_LANE;
     int k_max_this_pass = min(n_my_rings_total - k_offset, RINGS_PER_LANE);
 
-    // Precompute recurrence coefficients for this m (only if enabled)
-    if (USE_PRECOMPUTED_COEFF) {
+    // Precompute recurrence coefficients for this m (only if enabled and not tiling)
+    if (USE_PRECOMPUTED_COEFF && tile_size == 0) {
         for (int l = m + 2 + lane; l <= l_max; l += 32) {
             sh_log_A[l] = log_A_lm<C>(l, m);
             sh_log_B[l] = log_B_lm<C>(l, m);
@@ -455,93 +460,128 @@ __global__ void compute_fmy_kernel_v6(
             const T* alm_re_t = alm_real + (size_t)t * lp1 * lp1;
             const T* alm_im_t = alm_imag + (size_t)t * lp1 * lp1;
 
-            // Load alm values for this m (all l >= m)
-            // Note: alm is already scaled by 2 for m > 0 in Python wrapper
-            for (int l = m + lane; l <= l_max; l += 32) {
-                sh_alm_re[l] = alm_re_t[l * lp1 + m];
-                sh_alm_im[l] = alm_im_t[l * lp1 + m];
-            }
-            __syncwarp();
+            // Initialize per-ring state for tiled processing
+            // Fmy accumulators (persist across tiles)
+            C fmy_n_re_acc[RINGS_PER_LANE], fmy_n_im_acc[RINGS_PER_LANE];
+            C fmy_s_re_acc[RINGS_PER_LANE], fmy_s_im_acc[RINGS_PER_LANE];
+            // Ylm recurrence state (persists across tiles)
+            C log_Ylm_p1_state[RINGS_PER_LANE], log_Ylm_p2_state[RINGS_PER_LANE];
+            int8_t sign_p1_state[RINGS_PER_LANE], sign_p2_state[RINGS_PER_LANE];
 
-            // For each ring this lane handles, compute Fmy = sum_l(alm * Ylm)
-            // Using LOG-SPACE Ylm recurrence for numerical stability
             for (int k = k_start; k < k_end; k++) {
-                int global_r = lane + 32 * (k + k_offset);
-                int local_r = global_r - batch_start;
-                // Use cached log values (computed once per ring in batch init)
-                C log_cos_th = log_cos_th_cached[k];
-                int8_t sign_cos_th = sign_cos_th_cached[k];
+                fmy_n_re_acc[k] = C(0); fmy_n_im_acc[k] = C(0);
+                fmy_s_re_acc[k] = C(0); fmy_s_im_acc[k] = C(0);
+                // Initialize Ylm state from cached Y[m,m]
+                log_Ylm_p1_state[k] = log_Ymm_cached[k];
+                sign_p1_state[k] = sign_Ymm_cached[k];
+                log_Ylm_p2_state[k] = LogTraits::LOG_MIN;
+                sign_p2_state[k] = 0;
+            }
 
-                // Accumulate Fmy for north and south rings
-                C fmy_n_re = C(0), fmy_n_im = C(0);
-                C fmy_s_re = C(0), fmy_s_im = C(0);
+            // L-tiled processing: iterate over l in tiles
+            for (int l_tile = m; l_tile <= l_max; l_tile += eff_tile_size) {
+                int l_tile_end = min(l_tile + eff_tile_size, l_max + 1);
 
-                // Use cached Y[m,m] values
-                C log_Ylm_p1 = log_Ymm_cached[k];
-                int8_t sign_p1 = sign_Ymm_cached[k];
-                C log_Ylm_p2 = LogTraits::LOG_MIN;
-                int8_t sign_p2 = 0;
+                // Cooperative load of alm tile (all threads participate)
+                for (int l = l_tile + lane; l < l_tile_end; l += 32) {
+                    int local_l = l - l_tile;
+                    sh_alm_re[local_l] = alm_re_t[l * lp1 + m];
+                    sh_alm_im[local_l] = alm_im_t[l * lp1 + m];
+                }
+                __syncwarp();
 
-                // Ylm recurrence and accumulation
-                for (int l = m; l <= l_max; l++) {
-                    C log_Ylm;
-                    int8_t sign_Ylm;
+                // Each thread processes its rings for this tile
+                for (int k = k_start; k < k_end; k++) {
+                    C log_cos_th = log_cos_th_cached[k];
+                    int8_t sign_cos_th = sign_cos_th_cached[k];
 
-                    if (l == m) {
-                        log_Ylm = log_Ymm_cached[k];
-                        sign_Ylm = sign_Ymm_cached[k];
-                    } else if (l == m + 1) {
-                        // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
-                        log_Ylm = log_cos_th + log_recur_C_m1 + log_Ylm_p1;
-                        sign_Ylm = sign_cos_th * sign_p1;
+                    // Restore Ylm state from previous tile
+                    C log_Ylm_p1 = log_Ylm_p1_state[k];
+                    C log_Ylm_p2 = log_Ylm_p2_state[k];
+                    int8_t sign_p1 = sign_p1_state[k];
+                    int8_t sign_p2 = sign_p2_state[k];
 
-                        log_Ylm_p2 = log_Ylm_p1;
-                        sign_p2 = sign_p1;
-                        log_Ylm_p1 = log_Ylm;
-                        sign_p1 = sign_Ylm;
-                    } else {
-                        // Y[l,m] = A*cos_th*Y[l-1,m] - B*Y[l-2,m]
-                        C log_A = USE_PRECOMPUTED_COEFF ? sh_log_A[l] : log_A_lm<C>(l, m);
-                        C log_B = USE_PRECOMPUTED_COEFF ? sh_log_B[l] : log_B_lm<C>(l, m);
-                        C R1 = log_A + log_cos_th + log_Ylm_p1;
-                        int8_t S1 = sign_cos_th * sign_p1;
-                        C R2 = log_B + log_Ylm_p2;
-                        int8_t S2 = -sign_p2;  // Negative due to subtraction
+                    // Local accumulators for this tile (will add to persistent)
+                    C fmy_n_re = C(0), fmy_n_im = C(0);
+                    C fmy_s_re = C(0), fmy_s_im = C(0);
 
-                        logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+                    // Process l values in this tile
+                    for (int l = l_tile; l < l_tile_end; l++) {
+                        int local_l = l - l_tile;
+                        C log_Ylm;
+                        int8_t sign_Ylm;
 
-                        log_Ylm_p2 = log_Ylm_p1;
-                        sign_p2 = sign_p1;
-                        log_Ylm_p1 = log_Ylm;
-                        sign_p1 = sign_Ylm;
+                        if (l == m) {
+                            log_Ylm = log_Ymm_cached[k];
+                            sign_Ylm = sign_Ymm_cached[k];
+                        } else if (l == m + 1) {
+                            // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
+                            log_Ylm = log_cos_th + log_recur_C_m1 + log_Ylm_p1;
+                            sign_Ylm = sign_cos_th * sign_p1;
+
+                            log_Ylm_p2 = log_Ylm_p1;
+                            sign_p2 = sign_p1;
+                            log_Ylm_p1 = log_Ylm;
+                            sign_p1 = sign_Ylm;
+                        } else {
+                            // Y[l,m] = A*cos_th*Y[l-1,m] - B*Y[l-2,m]
+                            // When tiling, always compute coefficients on the fly
+                            C log_A = (USE_PRECOMPUTED_COEFF && tile_size == 0) ? sh_log_A[l] : log_A_lm<C>(l, m);
+                            C log_B = (USE_PRECOMPUTED_COEFF && tile_size == 0) ? sh_log_B[l] : log_B_lm<C>(l, m);
+                            C R1 = log_A + log_cos_th + log_Ylm_p1;
+                            int8_t S1 = sign_cos_th * sign_p1;
+                            C R2 = log_B + log_Ylm_p2;
+                            int8_t S2 = -sign_p2;  // Negative due to subtraction
+
+                            logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+
+                            log_Ylm_p2 = log_Ylm_p1;
+                            sign_p2 = sign_p1;
+                            log_Ylm_p1 = log_Ylm;
+                            sign_p1 = sign_Ylm;
+                        }
+
+                        // Convert to LINEAR for alm * Ylm multiplication
+                        C Ylm = sign_Ylm * LogTraits::exp_d(log_Ylm);
+
+                        // alm * Ylm contribution (use tiled index)
+                        C alm_re = C(sh_alm_re[local_l]);
+                        C alm_im = C(sh_alm_im[local_l]);
+
+                        // North: Fmy += alm * Ylm
+                        fmy_n_re += alm_re * Ylm;
+                        fmy_n_im += alm_im * Ylm;
+
+                        // South: Ylm(-cos_theta) = (-1)^(l+m) * Ylm(cos_theta)
+                        int parity = (l + m) & 1;
+                        C parity_sign = parity ? C(-1) : C(1);
+                        fmy_s_re += alm_re * (parity_sign * Ylm);
+                        fmy_s_im += alm_im * (parity_sign * Ylm);
                     }
 
-                    // Convert to LINEAR for alm * Ylm multiplication
-                    // Note: clamp removed - exp handles overflow/underflow gracefully
-                    C Ylm = sign_Ylm * LogTraits::exp_d(log_Ylm);
+                    // Save Ylm state for next tile
+                    log_Ylm_p1_state[k] = log_Ylm_p1;
+                    log_Ylm_p2_state[k] = log_Ylm_p2;
+                    sign_p1_state[k] = sign_p1;
+                    sign_p2_state[k] = sign_p2;
 
-                    // alm * Ylm contribution
-                    C alm_re = C(sh_alm_re[l]);
-                    C alm_im = C(sh_alm_im[l]);
-
-                    // North: Fmy += alm * Ylm
-                    fmy_n_re += alm_re * Ylm;
-                    fmy_n_im += alm_im * Ylm;
-
-                    // South: Ylm(-cos_theta) = (-1)^(l+m) * Ylm(cos_theta)
-                    int parity = (l + m) & 1;
-                    C parity_sign = parity ? C(-1) : C(1);
-                    fmy_s_re += alm_re * (parity_sign * Ylm);
-                    fmy_s_im += alm_im * (parity_sign * Ylm);
+                    // Accumulate to persistent accumulators
+                    fmy_n_re_acc[k] += fmy_n_re;
+                    fmy_n_im_acc[k] += fmy_n_im;
+                    fmy_s_re_acc[k] += fmy_s_re;
+                    fmy_s_im_acc[k] += fmy_s_im;
                 }
+                // No syncwarp needed - single warp in lockstep
+            }
 
-                // Combine N/S: Fmy_even = Fmy_n + Fmy_s, Fmy_odd = Fmy_n - Fmy_s
-                // Output layout: [n_maps, lp1, n_north_rings]
+            // Store final accumulated results
+            for (int k = k_start; k < k_end; k++) {
+                int global_r = lane + 32 * (k + k_offset);
                 size_t idx = (size_t)t * lp1 * n_north_rings + (size_t)m * n_north_rings + global_r;
-                Fmy_even_re[idx] = R(fmy_n_re + fmy_s_re);
-                Fmy_even_im[idx] = R(fmy_n_im + fmy_s_im);
-                Fmy_odd_re[idx]  = R(fmy_n_re - fmy_s_re);
-                Fmy_odd_im[idx]  = R(fmy_n_im - fmy_s_im);
+                Fmy_even_re[idx] = R(fmy_n_re_acc[k] + fmy_s_re_acc[k]);
+                Fmy_even_im[idx] = R(fmy_n_im_acc[k] + fmy_s_im_acc[k]);
+                Fmy_odd_re[idx]  = R(fmy_n_re_acc[k] - fmy_s_re_acc[k]);
+                Fmy_odd_im[idx]  = R(fmy_n_im_acc[k] - fmy_s_im_acc[k]);
             }
 
             __syncwarp();
@@ -1184,26 +1224,89 @@ void alm2map_cuda_v6_impl(
     }
 
     // Phase 1: Compute Fmy = sum_l(alm * Ylm)
-    // Shared memory: geometry (2 arrays) + alm (2 arrays) + optional coefficients (2 arrays)
-    // Must fit in 48KB (49152 bytes)
-    const size_t MAX_SMEM = 48 * 1024;
-    size_t base_smem = 2 * lp1 * sizeof(T);  // alm arrays (always needed)
-    size_t coeff_smem = 2 * lp1 * sizeof(R);  // coefficient arrays (optional)
+    // Shared memory layout: geometry (2 arrays) + alm (2 arrays) + optional coefficients (2 arrays)
+    // With L-tiling, alm arrays can be smaller than lp1
+    const size_t MAX_SMEM = 48 * 1024;  // Default limit, can be extended to ~100KB
+    const size_t EXTENDED_SMEM = 100 * 1024;  // Extended limit on compute 8.x
 
-    // Check if we can fit coefficients
-    bool use_precomputed = (base_smem + coeff_smem + 2 * RING_BATCH_SIZE * sizeof(R)) <= MAX_SMEM;
+    // Calculate minimum shared memory for geometry (ring batching)
+    size_t geom_smem = 2 * RING_BATCH_SIZE * sizeof(R);
 
-    int ring_batch_size;
+    // Calculate alm shared memory if no tiling (full lp1)
+    size_t alm_smem_full = 2 * lp1 * sizeof(T);
+    size_t coeff_smem_full = 2 * lp1 * sizeof(R);
+
+    // Determine if tiling is needed and compute tile_size
+    int tile_size = 0;  // 0 means no tiling (use full lp1)
+    int ring_batch_size = RING_BATCH_SIZE;
     size_t smem_p1;
-    if (use_precomputed) {
-        // Fit coefficients, use standard ring batch size
-        ring_batch_size = RING_BATCH_SIZE;
-        smem_p1 = 2 * ring_batch_size * sizeof(R) + base_smem + coeff_smem;
+    bool use_precomputed;
+
+    // Try without tiling first
+    if (alm_smem_full + coeff_smem_full + geom_smem <= MAX_SMEM) {
+        // Everything fits with precomputed coefficients
+        use_precomputed = true;
+        smem_p1 = geom_smem + alm_smem_full + coeff_smem_full;
+    } else if (alm_smem_full + geom_smem <= MAX_SMEM) {
+        // Fits without precomputed coefficients
+        use_precomputed = false;
+        smem_p1 = geom_smem + alm_smem_full;
+    } else if (alm_smem_full + geom_smem <= EXTENDED_SMEM) {
+        // Need extended shared memory, no precomputed coefficients
+        use_precomputed = false;
+        smem_p1 = geom_smem + alm_smem_full;
     } else {
-        // No room for coefficients, maximize ring batch size
-        size_t avail = MAX_SMEM - base_smem;
-        ring_batch_size = max(8, min((int)(avail / (2 * sizeof(R))), RING_BATCH_SIZE));
-        smem_p1 = 2 * ring_batch_size * sizeof(R) + base_smem;
+        // Need L-tiling: alm doesn't fit even with extended shared memory
+        // Compute tile_size to fit within MAX_SMEM (more conservative for occupancy)
+        use_precomputed = false;
+        size_t avail_for_alm = MAX_SMEM - geom_smem;
+        tile_size = (int)(avail_for_alm / (2 * sizeof(T)));
+        // Round down to multiple of 32 for coalesced access
+        tile_size = (tile_size / 32) * 32;
+        tile_size = max(256, tile_size);  // Minimum tile size for efficiency
+
+        size_t alm_smem_tiled = 2 * tile_size * sizeof(T);
+        smem_p1 = geom_smem + alm_smem_tiled;
+    }
+
+    // Request extended shared memory if needed (up to 100KB on compute 8.x)
+    if (smem_p1 > MAX_SMEM) {
+        #define SET_SMEM_ATTR(RINGS_PER_LANE_VAL, USE_PRECOMP) \
+            cudaFuncSetAttribute(compute_fmy_kernel_v6<T, R, USE_PRECOMP, RINGS_PER_LANE_VAL>, \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_p1)
+
+        cudaError_t attr_err;
+        if (use_precomputed) {
+            switch (config.rings_per_lane) {
+                case 16:  attr_err = SET_SMEM_ATTR(16, true);  break;
+                case 32:  attr_err = SET_SMEM_ATTR(32, true);  break;
+                case 64:  attr_err = SET_SMEM_ATTR(64, true);  break;
+                case 128: attr_err = SET_SMEM_ATTR(128, true); break;
+                default:  attr_err = cudaErrorInvalidValue;    break;
+            }
+        } else {
+            switch (config.rings_per_lane) {
+                case 16:  attr_err = SET_SMEM_ATTR(16, false);  break;
+                case 32:  attr_err = SET_SMEM_ATTR(32, false);  break;
+                case 64:  attr_err = SET_SMEM_ATTR(64, false);  break;
+                case 128: attr_err = SET_SMEM_ATTR(128, false); break;
+                default:  attr_err = cudaErrorInvalidValue;     break;
+            }
+        }
+        #undef SET_SMEM_ATTR
+
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "Error: alm2map Phase 1 requires %zu bytes shared memory "
+                    "(l_max=%d), but GPU limit exceeded.\n",
+                    smem_p1, l_max);
+            return;
+        }
+    }
+
+    // Debug output for transforms (only when timing enabled)
+    if (tile_size > 0 && timing_enabled) {
+        fprintf(stderr, "alm2map Phase 1: Using L-tiling with tile_size=%d (l_max=%d)\n",
+                tile_size, l_max);
     }
 
     // Dispatch macro for kernel launch with template instantiation
@@ -1212,6 +1315,7 @@ void alm2map_cuda_v6_impl(
             nside, l_max, n_maps, n_north_rings, \
             ring_batch_size, \
             ring_pass, config.n_ring_passes, \
+            tile_size, \
             alm_scaled_real, alm_scaled_imag, \
             Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im, \
             cos_theta, sin_theta \
@@ -1443,44 +1547,44 @@ void alm2map_cuda_v6_impl(
 // ============================================================================
 
 // Double storage, double recurrence
-template __global__ void compute_fmy_kernel_v6<double, double, true, 16>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, true, 32>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, true, 64>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, true, 128>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, false, 16>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, false, 32>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, false, 64>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<double, double, false, 128>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 16>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 32>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 64>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 128>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 16>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 32>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 64>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 128>(int, int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
 
 // Double storage, float recurrence
-template __global__ void compute_fmy_kernel_v6<double, float, true, 16>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, true, 32>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, true, 64>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, true, 128>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, false, 16>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, false, 32>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, false, 64>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<double, float, false, 128>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 16>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 32>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 64>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 128>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 16>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 32>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 64>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 128>(int, int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
 
 // Float storage, double recurrence
-template __global__ void compute_fmy_kernel_v6<float, double, true, 16>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, true, 32>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, true, 64>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, true, 128>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, false, 16>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, false, 32>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, false, 64>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
-template __global__ void compute_fmy_kernel_v6<float, double, false, 128>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 16>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 32>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 64>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 128>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 16>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 32>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 64>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 128>(int, int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
 
 // Float storage, float recurrence
-template __global__ void compute_fmy_kernel_v6<float, float, true, 16>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, true, 32>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, true, 64>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, true, 128>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, false, 16>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, false, 32>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, false, 64>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
-template __global__ void compute_fmy_kernel_v6<float, float, false, 128>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 16>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 32>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 64>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 128>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 16>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 32>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 64>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 128>(int, int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
 
 // ============================================================================
 // C API entry points

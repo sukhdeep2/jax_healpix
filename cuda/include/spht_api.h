@@ -56,16 +56,53 @@ int spht_alm2map(spht_context_t* ctx, int n_maps,
                  const complex_t* alm_in, real_t* map_out);
 
 /**
- * Standalone map2alm v6 (no context needed)
+ * Standalone map2alm v6 - LINEAR mode (no context needed)
  */
 void map2alm_cuda_v6(int nside, int l_max, int n_maps,
                       const real_t* map_in, complex_t* alm_out);
 
 /**
- * Standalone alm2map v6 (no context needed)
+ * Standalone alm2map v6 - LINEAR mode (no context needed)
  */
 void alm2map_cuda_v6(int nside, int l_max, int n_maps,
                       const complex_t* alm_in, real_t* map_out);
+
+/**
+ * V6 precision variants - LINEAR mode
+ */
+void map2alm_cuda_v6_f64_f64(int nside, int l_max, int n_maps,
+                              const double* map_in, double* alm_re, double* alm_im);
+void map2alm_cuda_v6_f64_f32(int nside, int l_max, int n_maps,
+                              const double* map_in, double* alm_re, double* alm_im);
+void map2alm_cuda_v6_f32_f64(int nside, int l_max, int n_maps,
+                              const float* map_in, float* alm_re, float* alm_im);
+void map2alm_cuda_v6_f32_f32(int nside, int l_max, int n_maps,
+                              const float* map_in, float* alm_re, float* alm_im);
+
+void alm2map_cuda_v6_f64_f64(int nside, int l_max, int n_maps,
+                              const double* alm_re, const double* alm_im, double* map_out);
+void alm2map_cuda_v6_f64_f32(int nside, int l_max, int n_maps,
+                              const double* alm_re, const double* alm_im, double* map_out);
+void alm2map_cuda_v6_f32_f64(int nside, int l_max, int n_maps,
+                              const float* alm_re, const float* alm_im, float* map_out);
+void alm2map_cuda_v6_f32_f32(int nside, int l_max, int n_maps,
+                              const float* alm_re, const float* alm_im, float* map_out);
+
+/**
+ * V6 precision variants - LOG mode (logsumexp accumulation)
+ *
+ * LOG mode uses log-space arithmetic for numerical stability.
+ * Required for bf16 precision, optional for f32/f64.
+ * ~5-10x slower than LINEAR mode but handles extreme dynamic range.
+ */
+void map2alm_cuda_v6_log_f64_f64(int nside, int l_max, int n_maps,
+                                  const double* map_in, double* alm_re, double* alm_im);
+void map2alm_cuda_v6_log_f64_f32(int nside, int l_max, int n_maps,
+                                  const double* map_in, double* alm_re, double* alm_im);
+void map2alm_cuda_v6_log_f32_f64(int nside, int l_max, int n_maps,
+                                  const float* map_in, float* alm_re, float* alm_im);
+void map2alm_cuda_v6_log_f32_f32(int nside, int l_max, int n_maps,
+                                  const float* map_in, float* alm_re, float* alm_im);
 
 /**
  * Allocate device memory for maps
