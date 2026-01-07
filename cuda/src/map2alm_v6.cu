@@ -156,6 +156,125 @@ KernelConfig calculate_kernel_config(int nside, int n_maps, int spin = 0) {
 }
 
 // ============================================================================
+// Workspace Cache - Eliminates malloc/free overhead on repeated calls
+// ============================================================================
+
+template<typename T, typename R>
+struct Map2almWorkspace {
+    // Buffer pointers
+    R* Gm_north_re = nullptr;
+    R* Gm_north_im = nullptr;
+    R* Gm_south_re = nullptr;
+    R* Gm_south_im = nullptr;
+    R* cos_theta = nullptr;
+    R* sin_theta = nullptr;
+    int* ring_sizes = nullptr;
+    void* chirped_data = nullptr;
+    void* conj_chirp_fft = nullptr;
+    R* bs_cos_theta = nullptr;
+    R* bs_sin_theta = nullptr;
+    R* eq_phi_0 = nullptr;
+    void* fft_out = nullptr;
+
+    // Cached sizes for reallocation check
+    size_t gm_size = 0;
+    size_t geom_size = 0;
+    size_t ring_sizes_size = 0;
+    size_t chirped_data_size = 0;
+    size_t conj_chirp_size = 0;
+    size_t eq_phi0_size = 0;
+    size_t fft_out_size = 0;
+
+    void ensure_size(size_t new_gm, size_t new_geom, size_t new_ring_sizes) {
+        if (new_gm > gm_size) {
+            if (Gm_north_re) cudaFree(Gm_north_re);
+            if (Gm_north_im) cudaFree(Gm_north_im);
+            if (Gm_south_re) cudaFree(Gm_south_re);
+            if (Gm_south_im) cudaFree(Gm_south_im);
+            cudaMalloc(&Gm_north_re, new_gm);
+            cudaMalloc(&Gm_north_im, new_gm);
+            cudaMalloc(&Gm_south_re, new_gm);
+            cudaMalloc(&Gm_south_im, new_gm);
+            gm_size = new_gm;
+        }
+        if (new_geom > geom_size) {
+            if (cos_theta) cudaFree(cos_theta);
+            if (sin_theta) cudaFree(sin_theta);
+            if (bs_cos_theta) cudaFree(bs_cos_theta);
+            if (bs_sin_theta) cudaFree(bs_sin_theta);
+            cudaMalloc(&cos_theta, new_geom);
+            cudaMalloc(&sin_theta, new_geom);
+            cudaMalloc(&bs_cos_theta, new_geom);
+            cudaMalloc(&bs_sin_theta, new_geom);
+            geom_size = new_geom;
+        }
+        if (new_ring_sizes > ring_sizes_size) {
+            if (ring_sizes) cudaFree(ring_sizes);
+            cudaMalloc(&ring_sizes, new_ring_sizes);
+            ring_sizes_size = new_ring_sizes;
+        }
+    }
+
+    void ensure_bluestein(size_t new_chirped, size_t new_conj) {
+        if (new_chirped > chirped_data_size) {
+            if (chirped_data) cudaFree(chirped_data);
+            cudaMalloc(&chirped_data, new_chirped);
+            chirped_data_size = new_chirped;
+        }
+        if (new_conj > conj_chirp_size) {
+            if (conj_chirp_fft) cudaFree(conj_chirp_fft);
+            cudaMalloc(&conj_chirp_fft, new_conj);
+            conj_chirp_size = new_conj;
+        }
+    }
+
+    void ensure_fft(size_t new_eq_phi0, size_t new_fft_out) {
+        if (new_eq_phi0 > eq_phi0_size) {
+            if (eq_phi_0) cudaFree(eq_phi_0);
+            cudaMalloc(&eq_phi_0, new_eq_phi0);
+            eq_phi0_size = new_eq_phi0;
+        }
+        if (new_fft_out > fft_out_size) {
+            if (fft_out) cudaFree(fft_out);
+            cudaMalloc(&fft_out, new_fft_out);
+            fft_out_size = new_fft_out;
+        }
+    }
+
+    ~Map2almWorkspace() {
+        if (Gm_north_re) cudaFree(Gm_north_re);
+        if (Gm_north_im) cudaFree(Gm_north_im);
+        if (Gm_south_re) cudaFree(Gm_south_re);
+        if (Gm_south_im) cudaFree(Gm_south_im);
+        if (cos_theta) cudaFree(cos_theta);
+        if (sin_theta) cudaFree(sin_theta);
+        if (ring_sizes) cudaFree(ring_sizes);
+        if (chirped_data) cudaFree(chirped_data);
+        if (conj_chirp_fft) cudaFree(conj_chirp_fft);
+        if (bs_cos_theta) cudaFree(bs_cos_theta);
+        if (bs_sin_theta) cudaFree(bs_sin_theta);
+        if (eq_phi_0) cudaFree(eq_phi_0);
+        if (fft_out) cudaFree(fft_out);
+    }
+};
+
+// Global workspace instances (one per precision combination)
+static Map2almWorkspace<double, double> g_m2a_ws_f64_f64;
+static Map2almWorkspace<double, float>  g_m2a_ws_f64_f32;
+static Map2almWorkspace<float, double>  g_m2a_ws_f32_f64;
+static Map2almWorkspace<float, float>   g_m2a_ws_f32_f32;
+static Map2almWorkspace<__nv_bfloat16, float> g_m2a_ws_bf16_f32;
+
+template<typename T, typename R>
+Map2almWorkspace<T, R>& get_map2alm_workspace();
+
+template<> Map2almWorkspace<double, double>& get_map2alm_workspace<double, double>() { return g_m2a_ws_f64_f64; }
+template<> Map2almWorkspace<double, float>&  get_map2alm_workspace<double, float>()  { return g_m2a_ws_f64_f32; }
+template<> Map2almWorkspace<float, double>&  get_map2alm_workspace<float, double>()  { return g_m2a_ws_f32_f64; }
+template<> Map2almWorkspace<float, float>&   get_map2alm_workspace<float, float>()   { return g_m2a_ws_f32_f32; }
+template<> Map2almWorkspace<__nv_bfloat16, float>& get_map2alm_workspace<__nv_bfloat16, float>() { return g_m2a_ws_bf16_f32; }
+
+// ============================================================================
 // Type traits for multi-precision support
 // ============================================================================
 
@@ -1600,19 +1719,24 @@ void map2alm_cuda_v6_impl(
     // Calculate optimal kernel configuration (template size, multi-pass, etc.)
     KernelConfig config = calculate_kernel_config<R>(nside, n_maps);
 
-    // Allocate intermediate buffers
+    // Get cached workspace (avoids malloc/free overhead on repeated calls)
+    Map2almWorkspace<T, R>& ws = get_map2alm_workspace<T, R>();
+
+    // Compute required sizes
     size_t gm_size = (size_t)n_maps * n_north_rings * lp1 * sizeof(R);
     size_t geom_size = n_north_rings * sizeof(R);
+    size_t ring_sizes_size = n_rings * sizeof(int);
 
-    R *Gm_north_re, *Gm_north_im, *Gm_south_re, *Gm_south_im;
-    R *cos_theta, *sin_theta;
+    // Ensure workspace has sufficient size (only reallocates if needed)
+    ws.ensure_size(gm_size, geom_size, ring_sizes_size);
 
-    CUDA_CHECK(cudaMalloc(&Gm_north_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_north_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_south_re, gm_size));
-    CUDA_CHECK(cudaMalloc(&Gm_south_im, gm_size));
-    CUDA_CHECK(cudaMalloc(&cos_theta, geom_size));
-    CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
+    // Use cached pointers
+    R* Gm_north_re = ws.Gm_north_re;
+    R* Gm_north_im = ws.Gm_north_im;
+    R* Gm_south_re = ws.Gm_south_re;
+    R* Gm_south_im = ws.Gm_south_im;
+    R* cos_theta = ws.cos_theta;
+    R* sin_theta = ws.sin_theta;
 
     // ================================================================
     // Phase 1: Compute Gm - method selected at runtime
@@ -1640,24 +1764,20 @@ void map2alm_cuda_v6_impl(
         int max_ring_size = 4 * nside;
         int M = next_power_of_2(2 * max_ring_size - 1);
 
-        // Allocate buffers
-        int* ring_sizes;
-        CUDA_CHECK(cudaMalloc(&ring_sizes, n_rings * sizeof(int)));
+        // Use cached ring_sizes buffer
+        int* ring_sizes = ws.ring_sizes;
 
         if (use_double_precision) {
             // Double precision Bluestein
-            cufftDoubleComplex* chirped_data;
-            cufftDoubleComplex* conj_chirp_fft;
-            double* bs_cos_theta;
-            double* bs_sin_theta;
-
             size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftDoubleComplex);
             size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftDoubleComplex);
 
-            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
-            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
-            CUDA_CHECK(cudaMalloc(&bs_cos_theta, n_north_rings * sizeof(double)));
-            CUDA_CHECK(cudaMalloc(&bs_sin_theta, n_north_rings * sizeof(double)));
+            // Use cached Bluestein buffers
+            ws.ensure_bluestein(chirp_data_size, conj_chirp_size);
+            cufftDoubleComplex* chirped_data = (cufftDoubleComplex*)ws.chirped_data;
+            cufftDoubleComplex* conj_chirp_fft = (cufftDoubleComplex*)ws.conj_chirp_fft;
+            double* bs_cos_theta = (double*)ws.bs_cos_theta;
+            double* bs_sin_theta = (double*)ws.bs_sin_theta;
 
             // Step 1: Pre-chirp multiplication and padding
             dim3 grid_pre(n_rings, n_maps);
@@ -1718,25 +1838,18 @@ void map2alm_cuda_v6_impl(
                 );
             }
 
-            // Cleanup
-            cudaFree(chirped_data);
-            cudaFree(conj_chirp_fft);
-            cudaFree(bs_cos_theta);
-            cudaFree(bs_sin_theta);
+            // No cudaFree - buffers are cached in workspace
         } else {
             // Float32 precision Bluestein
-            cufftComplex* chirped_data;
-            cufftComplex* conj_chirp_fft;
-            float* bs_cos_theta;
-            float* bs_sin_theta;
-
             size_t chirp_data_size = (size_t)n_maps * n_rings * M * sizeof(cufftComplex);
             size_t conj_chirp_size = (size_t)nside * M * sizeof(cufftComplex);
 
-            CUDA_CHECK(cudaMalloc(&chirped_data, chirp_data_size));
-            CUDA_CHECK(cudaMalloc(&conj_chirp_fft, conj_chirp_size));
-            CUDA_CHECK(cudaMalloc(&bs_cos_theta, n_north_rings * sizeof(float)));
-            CUDA_CHECK(cudaMalloc(&bs_sin_theta, n_north_rings * sizeof(float)));
+            // Use cached Bluestein buffers
+            ws.ensure_bluestein(chirp_data_size, conj_chirp_size);
+            cufftComplex* chirped_data = (cufftComplex*)ws.chirped_data;
+            cufftComplex* conj_chirp_fft = (cufftComplex*)ws.conj_chirp_fft;
+            float* bs_cos_theta = (float*)ws.bs_cos_theta;
+            float* bs_sin_theta = (float*)ws.bs_sin_theta;
 
             dim3 grid_pre(n_rings, n_maps);
             bluestein_pre_chirp_kernel_f32<T><<<grid_pre, 256>>>(
@@ -1785,13 +1898,10 @@ void map2alm_cuda_v6_impl(
                 );
             }
 
-            cudaFree(chirped_data);
-            cudaFree(conj_chirp_fft);
-            cudaFree(bs_cos_theta);
-            cudaFree(bs_sin_theta);
+            // No cudaFree - buffers are cached in workspace
         }
 
-        cudaFree(ring_sizes);
+        // No cudaFree for ring_sizes - cached in workspace
 
     } else if (g_phase1_method == Phase1Method::FFT_EQUATORIAL) {
         // ============================================================
@@ -2002,13 +2112,7 @@ skip_dft:
         cudaEventDestroy(end_p2);
     }
 
-    // Cleanup
-    cudaFree(Gm_north_re);
-    cudaFree(Gm_north_im);
-    cudaFree(Gm_south_re);
-    cudaFree(Gm_south_im);
-    cudaFree(cos_theta);
-    cudaFree(sin_theta);
+    // No cleanup needed - all buffers are cached in workspace for reuse
 }
 
 // ============================================================================
