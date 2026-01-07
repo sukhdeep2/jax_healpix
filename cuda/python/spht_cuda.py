@@ -113,6 +113,10 @@ _lib = None
 _cuda_rt = None
 _pinned_buffers = {}  # Cache for pinned memory buffers: (size, dtype) -> (h_real, h_imag)
 
+# Device buffer cache for I/O buffers (eliminates cudaMalloc/cudaFree overhead)
+# Keys: (buffer_name, use_f32), Values: (ptr, current_size)
+_device_buffers = {}
+
 def _get_lib():
     global _lib
     if _lib is None:
@@ -139,6 +143,46 @@ def _get_pinned_buffers(size, use_f32):
         cuda_rt.cudaHostAlloc(ctypes.byref(h_imag), size, 0)
         _pinned_buffers[key] = (h_real, h_imag)
     return _pinned_buffers[key]
+
+
+def _get_device_buffer(name: str, required_size: int, use_f32: bool):
+    """Get or allocate a cached device buffer using high-water mark pattern.
+
+    Args:
+        name: Buffer identifier (e.g., 'alm_real', 'alm_imag', 'map')
+        required_size: Required size in bytes
+        use_f32: Whether this is for f32 or f64 precision
+
+    Returns:
+        ctypes.c_void_p: Device pointer to buffer
+    """
+    global _device_buffers
+    key = (name, use_f32)
+    cuda_rt = _get_cuda_rt()
+
+    if key in _device_buffers:
+        ptr, current_size = _device_buffers[key]
+        if current_size >= required_size:
+            # Existing buffer is large enough
+            return ptr
+        else:
+            # Need larger buffer - free old one first
+            cuda_rt.cudaFree(ptr)
+
+    # Allocate new buffer
+    ptr = ctypes.c_void_p()
+    cuda_rt.cudaMalloc(ctypes.byref(ptr), required_size)
+    _device_buffers[key] = (ptr, required_size)
+    return ptr
+
+
+def clear_device_buffer_cache():
+    """Free all cached device buffers. Call this to release GPU memory."""
+    global _device_buffers
+    cuda_rt = _get_cuda_rt()
+    for key, (ptr, size) in _device_buffers.items():
+        cuda_rt.cudaFree(ptr)
+    _device_buffers.clear()
 
 def _setup_functions(lib):
     """Set up function signatures for the C library."""
@@ -523,19 +567,13 @@ class SPHTCuda:
         if timing_enabled:
             t_alloc_host = time.perf_counter()
 
-        # Allocate device memory
-        d_map = ctypes.c_void_p()
-        d_alm_real = ctypes.c_void_p()
-        d_alm_imag = ctypes.c_void_p()
+        # Get cached device buffers (no malloc/free per call)
+        d_map = _get_device_buffer('m2a_map', map_size, use_f32)
+        d_alm_real = _get_device_buffer('m2a_alm_real', alm_size, use_f32)
+        d_alm_imag = _get_device_buffer('m2a_alm_imag', alm_size, use_f32)
 
         if timing_enabled:
             t_get_rt = time.perf_counter()
-
-        cuda_rt.cudaMalloc(ctypes.byref(d_map), map_size)
-        cuda_rt.cudaMalloc(ctypes.byref(d_alm_real), alm_size)
-        cuda_rt.cudaMalloc(ctypes.byref(d_alm_imag), alm_size)
-
-        if timing_enabled:
             t_alloc_dev = time.perf_counter()
 
         cuda_rt.cudaMemset(d_alm_real, 0, alm_size)
@@ -551,40 +589,37 @@ class SPHTCuda:
         if timing_enabled:
             t_h2d = time.perf_counter()
 
-        try:
-            # Select kernel based on precision combination
-            if use_f32:
-                if use_f32_recur:
-                    self._lib.map2alm_cuda_v6_f32_f32(
-                        self.nside, self.l_max, n_maps,
-                        d_map, d_alm_real, d_alm_imag)
-                else:
-                    self._lib.map2alm_cuda_v6_f32_f64(
-                        self.nside, self.l_max, n_maps,
-                        d_map, d_alm_real, d_alm_imag)
+        # Select kernel based on precision combination
+        if use_f32:
+            if use_f32_recur:
+                self._lib.map2alm_cuda_v6_f32_f32(
+                    self.nside, self.l_max, n_maps,
+                    d_map, d_alm_real, d_alm_imag)
             else:
-                if use_f32_recur:
-                    self._lib.map2alm_cuda_v6_f64_f32(
-                        self.nside, self.l_max, n_maps,
-                        d_map, d_alm_real, d_alm_imag)
-                else:
-                    self._lib.map2alm_cuda_v6_f64_f64(
-                        self.nside, self.l_max, n_maps,
-                        d_map, d_alm_real, d_alm_imag)
+                self._lib.map2alm_cuda_v6_f32_f64(
+                    self.nside, self.l_max, n_maps,
+                    d_map, d_alm_real, d_alm_imag)
+        else:
+            if use_f32_recur:
+                self._lib.map2alm_cuda_v6_f64_f32(
+                    self.nside, self.l_max, n_maps,
+                    d_map, d_alm_real, d_alm_imag)
+            else:
+                self._lib.map2alm_cuda_v6_f64_f64(
+                    self.nside, self.l_max, n_maps,
+                    d_map, d_alm_real, d_alm_imag)
 
-            if timing_enabled:
-                t_kernel = time.perf_counter()
+        if timing_enabled:
+            t_kernel = time.perf_counter()
 
-            # Copy results to pinned host memory
-            cuda_rt.cudaMemcpy(h_alm_real, d_alm_real, alm_size, 2)  # cudaMemcpyDeviceToHost = 2
-            cuda_rt.cudaMemcpy(h_alm_imag, d_alm_imag, alm_size, 2)
+        # Copy results to pinned host memory
+        cuda_rt.cudaMemcpy(h_alm_real, d_alm_real, alm_size, 2)  # cudaMemcpyDeviceToHost = 2
+        cuda_rt.cudaMemcpy(h_alm_imag, d_alm_imag, alm_size, 2)
 
-            if timing_enabled:
-                t_d2h = time.perf_counter()
-        finally:
-            cuda_rt.cudaFree(d_map)
-            cuda_rt.cudaFree(d_alm_real)
-            cuda_rt.cudaFree(d_alm_imag)
+        if timing_enabled:
+            t_d2h = time.perf_counter()
+
+        # No cudaFree - buffers are cached for reuse
 
         if timing_enabled:
             t_free = time.perf_counter()
@@ -862,14 +897,10 @@ class SPHTCuda:
         if timing_enabled:
             t_get_rt = time.perf_counter()
 
-        # Allocate device memory
-        d_alm_real = ctypes.c_void_p()
-        d_alm_imag = ctypes.c_void_p()
-        d_map = ctypes.c_void_p()
-
-        cuda_rt.cudaMalloc(ctypes.byref(d_alm_real), alm_size)
-        cuda_rt.cudaMalloc(ctypes.byref(d_alm_imag), alm_size)
-        cuda_rt.cudaMalloc(ctypes.byref(d_map), map_size)
+        # Get cached device buffers (no malloc/free per call)
+        d_alm_real = _get_device_buffer('a2m_alm_real', alm_size, use_f32)
+        d_alm_imag = _get_device_buffer('a2m_alm_imag', alm_size, use_f32)
+        d_map = _get_device_buffer('a2m_map', map_size, use_f32)
 
         if timing_enabled:
             t_alloc = time.perf_counter()
@@ -883,45 +914,41 @@ class SPHTCuda:
         if timing_enabled:
             t_h2d = time.perf_counter()
 
-        try:
-            # Select kernel based on precision combination
-            if use_f32:
-                if use_f32_recur:
-                    self._lib.alm2map_cuda_v6_f32_f32(
-                        self.nside, self.l_max, n_maps,
-                        d_alm_real, d_alm_imag, d_map)
-                else:
-                    self._lib.alm2map_cuda_v6_f32_f64(
-                        self.nside, self.l_max, n_maps,
-                        d_alm_real, d_alm_imag, d_map)
+        # Select kernel based on precision combination
+        if use_f32:
+            if use_f32_recur:
+                self._lib.alm2map_cuda_v6_f32_f32(
+                    self.nside, self.l_max, n_maps,
+                    d_alm_real, d_alm_imag, d_map)
             else:
-                if use_f32_recur:
-                    self._lib.alm2map_cuda_v6_f64_f32(
-                        self.nside, self.l_max, n_maps,
-                        d_alm_real, d_alm_imag, d_map)
-                else:
-                    self._lib.alm2map_cuda_v6_f64_f64(
-                        self.nside, self.l_max, n_maps,
-                        d_alm_real, d_alm_imag, d_map)
+                self._lib.alm2map_cuda_v6_f32_f64(
+                    self.nside, self.l_max, n_maps,
+                    d_alm_real, d_alm_imag, d_map)
+        else:
+            if use_f32_recur:
+                self._lib.alm2map_cuda_v6_f64_f32(
+                    self.nside, self.l_max, n_maps,
+                    d_alm_real, d_alm_imag, d_map)
+            else:
+                self._lib.alm2map_cuda_v6_f64_f64(
+                    self.nside, self.l_max, n_maps,
+                    d_alm_real, d_alm_imag, d_map)
 
-            if timing_enabled:
-                t_kernel = time.perf_counter()
+        if timing_enabled:
+            t_kernel = time.perf_counter()
 
-            # Allocate output
-            map_shape = (n_maps, self.n_rings, 4 * self.nside)
-            map_out = np.zeros(map_shape, dtype=map_dtype)
+        # Allocate output
+        map_shape = (n_maps, self.n_rings, 4 * self.nside)
+        map_out = np.zeros(map_shape, dtype=map_dtype)
 
-            # Copy result back
-            cuda_rt.cudaMemcpy(map_out.ctypes.data_as(c_void_p),
-                              d_map, map_size, 2)  # cudaMemcpyDeviceToHost = 2
+        # Copy result back
+        cuda_rt.cudaMemcpy(map_out.ctypes.data_as(c_void_p),
+                          d_map, map_size, 2)  # cudaMemcpyDeviceToHost = 2
 
-            if timing_enabled:
-                t_d2h = time.perf_counter()
+        if timing_enabled:
+            t_d2h = time.perf_counter()
 
-        finally:
-            cuda_rt.cudaFree(d_alm_real)
-            cuda_rt.cudaFree(d_alm_imag)
-            cuda_rt.cudaFree(d_map)
+        # No cudaFree - buffers are cached for reuse
 
         if timing_enabled:
             t_free = time.perf_counter()
