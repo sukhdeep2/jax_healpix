@@ -2,14 +2,24 @@
 """Accuracy test for CUDA spin-2 map2alm vs JAX reference.
 
 Usage:
-    python accuracy_map2alm_spin2.py [nside] [l_max]
+    python accuracy_map2alm_spin2.py [options]
 
-    nside: HEALPix resolution parameter (default: 64)
-    l_max: Maximum multipole (default: 3*nside)
+Options:
+    --nside=N       HEALPix resolution parameter (default: 64)
+    --lmax=N        Maximum multipole (default: 3*nside)
+    --linear        Use LINEAR accumulation mode (default)
+    --log           Use LOG accumulation mode
+    --help          Show this help
+
+Examples:
+    python accuracy_map2alm_spin2.py                    # Default: nside=64, LINEAR mode
+    python accuracy_map2alm_spin2.py --nside=128        # nside=128, LINEAR mode
+    python accuracy_map2alm_spin2.py --log              # nside=64, LOG mode
 """
 
 import numpy as np
 import sys
+import argparse
 sys.path.insert(0, '/home/deep/repos/SPHT/cuda/python')
 sys.path.insert(0, '/home/deep/repos/SPHT/jax_healpix')
 
@@ -18,11 +28,12 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from SPHT_jax import map2alm as jax_map2alm
-from spht_cuda import SPHTCuda, set_phase1_method, PHASE1_DFT, PHASE1_BLUESTEIN
+from spht_cuda import SPHTCuda, set_phase1_method, set_precision, PHASE1_DFT, PHASE1_BLUESTEIN
 
 # Default parameters
 NSIDE = 64
 THRESHOLD = 1e-10  # Relative error threshold
+ACCUMULATION_MODE = "linear"  # Default accumulation mode
 
 
 def create_random_qu_maps(nside, dtype=np.float64):
@@ -64,7 +75,8 @@ def compute_relative_diff(cuda_alm, jax_alm, nside, l_min=2):
 
 
 def test_cuda_vs_jax(nside, l_max, storage='float64', recurrence='float64',
-                     phase1_method=PHASE1_DFT, phase1_name='DFT'):
+                     phase1_method=PHASE1_DFT, phase1_name='DFT',
+                     accumulation_mode='linear'):
     """Test CUDA spin-2 map2alm against JAX reference."""
     set_phase1_method(phase1_method)
 
@@ -82,7 +94,8 @@ def test_cuda_vs_jax(nside, l_max, storage='float64', recurrence='float64',
     dtype = np.float64 if storage == 'float64' else np.float32
     spht = SPHTCuda(nside, l_max, version='v6',
                     storage_precision=storage,
-                    recurrence_precision=recurrence)
+                    recurrence_precision=recurrence,
+                    accumulation_mode=accumulation_mode)
 
     # CUDA expects {2: array} with shape [n_maps, n_rings, 4*nside, 2]
     maps_cuda = {2: QU_packed.astype(dtype)}
@@ -101,13 +114,14 @@ def test_cuda_vs_jax(nside, l_max, storage='float64', recurrence='float64',
     }
 
 
-def run_accuracy_tests(nside, l_max):
+def run_accuracy_tests(nside, l_max, accumulation_mode='linear'):
     """Run full accuracy test suite."""
     print("=" * 80)
     print("Spin-2 map2alm Accuracy Test: CUDA vs JAX")
     print("=" * 80)
     print(f"  nside     = {nside}")
     print(f"  l_max     = {l_max}")
+    print(f"  mode      = {accumulation_mode.upper()}")
     print(f"  threshold = {THRESHOLD:.0e}")
     print("=" * 80)
     print()
@@ -127,7 +141,8 @@ def run_accuracy_tests(nside, l_max):
 
     for name, storage, recurrence, phase1, phase1_name in configs:
         try:
-            result = test_cuda_vs_jax(nside, l_max, storage, recurrence, phase1, phase1_name)
+            result = test_cuda_vs_jax(nside, l_max, storage, recurrence, phase1, phase1_name,
+                                       accumulation_mode=accumulation_mode)
 
             # Use looser threshold for f32
             threshold = THRESHOLD if storage == 'float64' else 1e-5
@@ -152,7 +167,8 @@ def run_accuracy_tests(nside, l_max):
     print("Sample E-mode ALM values (l=2,5,10, m=0,1,2):")
     print("-" * 60)
 
-    result = test_cuda_vs_jax(nside, l_max, 'float64', 'float64', PHASE1_DFT, 'DFT')
+    result = test_cuda_vs_jax(nside, l_max, 'float64', 'float64', PHASE1_DFT, 'DFT',
+                               accumulation_mode=accumulation_mode)
     cuda_E = result['E'][2]
     jax_E = result['E'][3]
 
@@ -186,11 +202,37 @@ def run_accuracy_tests(nside, l_max):
     return all_pass
 
 
-def main():
-    nside = int(sys.argv[1]) if len(sys.argv) > 1 else NSIDE
-    l_max = int(sys.argv[2]) if len(sys.argv) > 2 else 3 * nside
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Accuracy test for CUDA spin-2 map2alm vs JAX reference.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python accuracy_map2alm_spin2.py                    # Default: nside=64, LINEAR mode
+    python accuracy_map2alm_spin2.py --nside=128        # nside=128, LINEAR mode
+    python accuracy_map2alm_spin2.py --log              # nside=64, LOG mode
+        """
+    )
+    parser.add_argument('--nside', type=int, default=NSIDE,
+                        help=f'HEALPix resolution parameter (default: {NSIDE})')
+    parser.add_argument('--lmax', type=int, default=None,
+                        help='Maximum multipole (default: 3*nside)')
+    parser.add_argument('--linear', action='store_true', default=True,
+                        help='Use LINEAR accumulation mode (default)')
+    parser.add_argument('--log', action='store_true',
+                        help='Use LOG accumulation mode')
+    return parser.parse_args()
 
-    success = run_accuracy_tests(nside, l_max)
+
+def main():
+    args = parse_args()
+
+    nside = args.nside
+    l_max = args.lmax if args.lmax else 3 * nside
+    accumulation_mode = 'log' if args.log else 'linear'
+
+    success = run_accuracy_tests(nside, l_max, accumulation_mode)
     sys.exit(0 if success else 1)
 
 

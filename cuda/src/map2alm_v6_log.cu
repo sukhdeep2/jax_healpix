@@ -1,17 +1,16 @@
 /**
  * map2alm_v6_log: LOG accumulation mode for map2alm
  *
- * This kernel uses full log-space computation including Phase 2 accumulation.
- * Required for bf16 precision, optional for f32/f64 with extreme dynamic range.
+ * This kernel uses full log-space computation throughout:
+ *   - Log-space Ylm recurrence (same as LINEAR mode)
+ *   - Log-space Gm coefficients
+ *   - Logsumexp accumulation
  *
- * Key differences from LINEAR mode:
- *   - Gm coefficients kept in log-Cartesian form
- *   - Accumulation uses logsumexp instead of FMA
- *   - ~5-10x slower than LINEAR but handles overflow/underflow
+ * The loop structure is identical to LINEAR mode: O(l_max) per ring batch.
+ * The only difference is Gm storage (log vs linear) and accumulation method.
  *
  * Pipeline:
- *   Phase 1: Ring DFT (reuse from LINEAR mode) -> Linear Gm
- *   Convert: Linear Gm -> Log-Cartesian Gm (once per m,ring)
+ *   Phase 1: Ring DFT -> Linear Gm -> Convert to Log Gm
  *   Phase 2: Ylm recurrence (log-space) + logsumexp accumulation
  *   Output: Linear alm (converted from log at store)
  */
@@ -24,17 +23,6 @@
 #include <stdio.h>
 #include <type_traits>
 
-// External declarations for Phase 1 DFT (from map2alm_v6.cu)
-// We reuse the DFT Phase 1 kernels to compute Gm in linear space
-template<typename T, typename R>
-extern void compute_phase1_gm(
-    int nside, int l_max, int n_maps, int n_rings, int n_north_rings,
-    const T* map_in,
-    R* Gm_north_re, R* Gm_north_im,
-    R* Gm_south_re, R* Gm_south_im,
-    R* cos_theta, R* sin_theta
-);
-
 // Forward declaration of DFT kernel for Phase 1 (defined in map2alm_v6.cu)
 template<typename T, typename R>
 __global__ void compute_gm_kernel_v6(
@@ -46,18 +34,18 @@ __global__ void compute_gm_kernel_v6(
 );
 
 // ============================================================================
-// Workspace for LOG mode (manages additional log-space buffers)
+// Workspace for LOG mode
 // ============================================================================
 
 template<typename T, typename R>
 struct Map2almLogWorkspace {
-    // Linear Gm buffers (same as LINEAR mode)
+    // Linear Gm buffers (from Phase 1)
     R* Gm_north_re = nullptr;
     R* Gm_north_im = nullptr;
     R* Gm_south_re = nullptr;
     R* Gm_south_im = nullptr;
 
-    // Log-space Gm buffers (additional for LOG mode)
+    // Log-space Gm buffers
     R* Gm_north_log_re = nullptr;
     R* Gm_north_log_im = nullptr;
     R* Gm_south_log_re = nullptr;
@@ -154,8 +142,37 @@ template<> Map2almLogWorkspace<float, double>&  get_map2alm_log_workspace<float,
 template<> Map2almLogWorkspace<float, float>&   get_map2alm_log_workspace<float, float>()   { return g_m2a_log_ws_f32_f32; }
 
 // ============================================================================
-// LOG Accumulation Kernel - Phase 2 with logsumexp
+// Conversion Kernel: Linear Gm -> Log-Cartesian Gm
 // ============================================================================
+
+template<typename T, typename R>
+__global__ void convert_gm_to_log_kernel(
+    int n_elements,
+    const T* __restrict__ gm_re_in,
+    const T* __restrict__ gm_im_in,
+    R* __restrict__ log_re_out,
+    R* __restrict__ log_im_out,
+    int8_t* __restrict__ sign_re_out,
+    int8_t* __restrict__ sign_im_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    R re = R(gm_re_in[idx]);
+    R im = R(gm_im_in[idx]);
+
+    log_re_out[idx] = safe_log_typed<R>(re);
+    log_im_out[idx] = safe_log_typed<R>(im);
+    sign_re_out[idx] = sign_of<R>(re);
+    sign_im_out[idx] = sign_of<R>(im);
+}
+
+// ============================================================================
+// Phase 2 LOG Kernel - O(l_max) structure matching LINEAR mode
+// ============================================================================
+
+#define LOG_RING_BATCH_SIZE 64
+#define LOG_RINGS_PER_LANE 4
 
 /**
  * Log-space accumulator state for a single alm coefficient
@@ -176,8 +193,7 @@ struct LogAlmAccumulator {
         initialized = false;
     }
 
-    // Accumulate: acc += Ylm * Gm * weight
-    // All inputs in log-space
+    // Accumulate: acc += Ylm * Gm * weight (all in log-space)
     __device__ __forceinline__ void accumulate(
         C log_Ylm, int8_t sign_Ylm,
         C log_Gm_re, int8_t sign_Gm_re,
@@ -247,41 +263,18 @@ __device__ __forceinline__ void warp_reduce_log_accum(LogAlmAccumulator<C>* acc)
     }
 }
 
-// ============================================================================
-// Conversion Kernel: Linear Gm -> Log-Cartesian Gm
-// ============================================================================
-
+/**
+ * LOG mode Phase 2 kernel with O(l_max) structure (matching LINEAR mode).
+ *
+ * Structure:
+ *   for each batch of rings:
+ *       initialize Ymm (once per batch)
+ *       for l = m to l_max:           // O(l_max) - single pass
+ *           compute Ylm via recurrence
+ *           accumulate using logsumexp
+ */
 template<typename T, typename R>
-__global__ void convert_gm_to_log_kernel(
-    int n_elements,
-    const T* __restrict__ gm_re_in,
-    const T* __restrict__ gm_im_in,
-    R* __restrict__ log_re_out,
-    R* __restrict__ log_im_out,
-    int8_t* __restrict__ sign_re_out,
-    int8_t* __restrict__ sign_im_out
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_elements) return;
-
-    R re = R(gm_re_in[idx]);
-    R im = R(gm_im_in[idx]);
-
-    log_re_out[idx] = safe_log_typed<R>(re);
-    log_im_out[idx] = safe_log_typed<R>(im);
-    sign_re_out[idx] = sign_of<R>(re);
-    sign_im_out[idx] = sign_of<R>(im);
-}
-
-// ============================================================================
-// Phase 2 LOG Kernel - Main reduction kernel
-// ============================================================================
-
-#define LOG_RING_BATCH_SIZE 64
-#define LOG_RINGS_PER_LANE 4
-
-template<typename T, typename R>
-__global__ void reduce_to_alm_log_kernel(
+__global__ void reduce_to_alm_log_kernel_v2(
     int nside, int l_max, int n_maps, int n_north_rings,
     const R* __restrict__ Gm_north_log_re,
     const R* __restrict__ Gm_north_log_im,
@@ -311,18 +304,17 @@ __global__ void reduce_to_alm_log_kernel(
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + LOG_RING_BATCH_SIZE;
 
-    // Per-lane Ylm state
+    // Per-lane Ylm state (log-space)
     C log_Ylm_prev1[LOG_RINGS_PER_LANE];
     C log_Ylm_prev2[LOG_RINGS_PER_LANE];
     int8_t sign_prev1[LOG_RINGS_PER_LANE];
     int8_t sign_prev2[LOG_RINGS_PER_LANE];
-    C log_Ymm_saved[LOG_RINGS_PER_LANE];
-    int8_t sign_Ymm_saved[LOG_RINGS_PER_LANE];
     C log_cos_th_cached[LOG_RINGS_PER_LANE];
     int8_t sign_cos_th_cached[LOG_RINGS_PER_LANE];
 
-    // Per-l accumulator (accumulates across all batches for this l)
-    LogAlmAccumulator<C> l_acc[1];  // One per l being processed
+    // Per-l accumulators (one per l value)
+    // We'll use shared memory for these since l_max can be large
+    LogAlmAccumulator<C>* sh_accum = (LogAlmAccumulator<C>*)(sh_sin_th + LOG_RING_BATCH_SIZE);
 
     // Precompute m-dependent constants
     const C log_prefact = compute_log_prefact_ymm<C>(m);
@@ -333,125 +325,125 @@ __global__ void reduce_to_alm_log_kernel(
     for (int map_idx = 0; map_idx < n_maps; map_idx++) {
         size_t gm_base_idx = (size_t)map_idx * lp1 * n_north_rings + (size_t)m * n_north_rings;
 
-        // Initialize all l accumulators
-        for (int l = m; l <= l_max; l++) {
-            // Process all ring batches for this l
-            LogAlmAccumulator<C> acc;
-            acc.reset();
+        // Initialize all l accumulators (cooperatively)
+        for (int l = m + lane; l <= l_max; l += 32) {
+            sh_accum[l - m].reset();
+        }
+        __syncwarp();
 
-            for (int batch_start = 0; batch_start < n_north_rings; batch_start += LOG_RING_BATCH_SIZE) {
-                int batch_end = min(batch_start + LOG_RING_BATCH_SIZE, n_north_rings);
-                int batch_size = batch_end - batch_start;
+        // Process ring batches - O(l_max) per batch
+        for (int batch_start = 0; batch_start < n_north_rings; batch_start += LOG_RING_BATCH_SIZE) {
+            int batch_end = min(batch_start + LOG_RING_BATCH_SIZE, n_north_rings);
+            int batch_size = batch_end - batch_start;
 
-                // Load geometry cooperatively
-                for (int r = lane; r < batch_size; r += 32) {
-                    sh_cos_th[r] = cos_theta[batch_start + r];
-                    sh_sin_th[r] = sin_theta[batch_start + r];
-                }
-                __syncwarp();
+            // Load geometry cooperatively
+            for (int r = lane; r < batch_size; r += 32) {
+                sh_cos_th[r] = cos_theta[batch_start + r];
+                sh_sin_th[r] = sin_theta[batch_start + r];
+            }
+            __syncwarp();
 
-                // Determine this lane's rings
-                int rings_per_lane = (batch_size + 31) / 32;
-                int my_ring_count = min(rings_per_lane, LOG_RINGS_PER_LANE);
+            // Determine this lane's rings
+            int rings_per_lane = (batch_size + 31) / 32;
+            int my_ring_count = min(rings_per_lane, LOG_RINGS_PER_LANE);
 
-                // Initialize Ymm for rings in this batch
+            // Initialize Ymm for rings in this batch (ONCE per batch)
+            for (int k = 0; k < my_ring_count; k++) {
+                int local_r = lane + 32 * k;
+                if (local_r >= batch_size) break;
+
+                C sin_th = C(sh_sin_th[local_r]);
+                C cos_th = C(sh_cos_th[local_r]);
+
+                log_cos_th_cached[k] = safe_log_typed<C>(cos_th);
+                sign_cos_th_cached[k] = sign_of<C>(cos_th);
+
+                C log_sin_th = safe_log_typed<C>(sin_th);
+                C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
+                int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);
+
+                log_Ylm_prev1[k] = log_Ymm;
+                sign_prev1[k] = sign_Ymm;
+                log_Ylm_prev2[k] = Traits::LOG_MIN;
+                sign_prev2[k] = 0;
+            }
+
+            // SINGLE PASS over all l values - O(l_max) complexity
+            for (int l = m; l <= l_max; l++) {
+                // Per-lane accumulator for this l
+                LogAlmAccumulator<C> lane_acc;
+                lane_acc.reset();
+
+                // Process all rings for this lane
                 for (int k = 0; k < my_ring_count; k++) {
                     int local_r = lane + 32 * k;
                     if (local_r >= batch_size) break;
+                    int global_r = batch_start + local_r;
 
-                    C sin_th = C(sh_sin_th[local_r]);
-                    C cos_th = C(sh_cos_th[local_r]);
+                    C log_Ylm;
+                    int8_t sign_Ylm;
 
-                    log_cos_th_cached[k] = safe_log_typed<C>(cos_th);
-                    sign_cos_th_cached[k] = sign_of<C>(cos_th);
+                    if (l == m) {
+                        log_Ylm = log_Ylm_prev1[k];
+                        sign_Ylm = sign_prev1[k];
+                    } else if (l == m + 1) {
+                        log_Ylm = log_cos_th_cached[k] + log_recur_C_m1 + log_Ylm_prev1[k];
+                        sign_Ylm = sign_cos_th_cached[k] * sign_prev1[k];
 
-                    C log_sin_th = safe_log_typed<C>(sin_th);
-                    C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
-                    int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
+                    } else {
+                        C log_A = log_A_lm<C>(l, m);
+                        C log_B = log_B_lm<C>(l, m);
+                        C R1 = log_A + log_cos_th_cached[k] + log_Ylm_prev1[k];
+                        int8_t S1 = sign_cos_th_cached[k] * sign_prev1[k];
+                        C R2 = log_B + log_Ylm_prev2[k];
+                        int8_t S2 = -sign_prev2[k];
 
-                    log_Ymm_saved[k] = log_Ymm;
-                    sign_Ymm_saved[k] = sign_Ymm;
-                    log_Ylm_prev1[k] = log_Ymm;
-                    sign_prev1[k] = sign_Ymm;
-                    log_Ylm_prev2[k] = Traits::LOG_MIN;
-                    sign_prev2[k] = 0;
-                }
+                        logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
 
-                // Advance Ylm recurrence to reach l
-                for (int curr_l = m; curr_l <= l; curr_l++) {
-                    // NORTH PASS
-                    for (int k = 0; k < my_ring_count; k++) {
-                        int local_r = lane + 32 * k;
-                        if (local_r >= batch_size) break;
-                        int global_r = batch_start + local_r;
-
-                        C log_Ylm;
-                        int8_t sign_Ylm;
-
-                        if (curr_l == m) {
-                            log_Ylm = log_Ylm_prev1[k];
-                            sign_Ylm = sign_prev1[k];
-                        } else if (curr_l == m + 1) {
-                            log_Ylm = log_cos_th_cached[k] + log_recur_C_m1 + log_Ylm_prev1[k];
-                            sign_Ylm = sign_cos_th_cached[k] * sign_prev1[k];
-
-                            log_Ylm_prev2[k] = log_Ylm_prev1[k];
-                            sign_prev2[k] = sign_prev1[k];
-                            log_Ylm_prev1[k] = log_Ylm;
-                            sign_prev1[k] = sign_Ylm;
-                        } else {
-                            C log_A = log_A_lm<C>(curr_l, m);
-                            C log_B = log_B_lm<C>(curr_l, m);
-                            C R1 = log_A + log_cos_th_cached[k] + log_Ylm_prev1[k];
-                            int8_t S1 = sign_cos_th_cached[k] * sign_prev1[k];
-                            C R2 = log_B + log_Ylm_prev2[k];
-                            int8_t S2 = -sign_prev2[k];
-
-                            logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
-
-                            log_Ylm_prev2[k] = log_Ylm_prev1[k];
-                            sign_prev2[k] = sign_prev1[k];
-                            log_Ylm_prev1[k] = log_Ylm;
-                            sign_prev1[k] = sign_Ylm;
-                        }
-
-                        // Only accumulate at target l
-                        if (curr_l == l) {
-                            size_t idx = gm_base_idx + global_r;
-                            C log_Gm_re = C(Gm_north_log_re[idx]);
-                            C log_Gm_im = C(Gm_north_log_im[idx]);
-                            int8_t sign_Gm_re = Gm_north_sign_re[idx];
-                            int8_t sign_Gm_im = Gm_north_sign_im[idx];
-
-                            acc.accumulate(log_Ylm, sign_Ylm,
-                                           log_Gm_re, sign_Gm_re,
-                                           log_Gm_im, sign_Gm_im,
-                                           log_pix_area);
-
-                            // SOUTH PASS - Y_l^m(pi-theta) = (-1)^(l+m) * Y_l^m(theta)
-                            int8_t south_sign = ((l + m) & 1) ? -sign_Ylm : sign_Ylm;
-                            C log_Gm_south_re = C(Gm_south_log_re[idx]);
-                            C log_Gm_south_im = C(Gm_south_log_im[idx]);
-                            int8_t sign_Gm_south_re = Gm_south_sign_re[idx];
-                            int8_t sign_Gm_south_im = Gm_south_sign_im[idx];
-
-                            acc.accumulate(log_Ylm, south_sign,
-                                           log_Gm_south_re, sign_Gm_south_re,
-                                           log_Gm_south_im, sign_Gm_south_im,
-                                           log_pix_area);
-                        }
+                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
+                        sign_prev2[k] = sign_prev1[k];
+                        log_Ylm_prev1[k] = log_Ylm;
+                        sign_prev1[k] = sign_Ylm;
                     }
+
+                    // Load log-space Gm values
+                    size_t idx = gm_base_idx + global_r;
+
+                    // North contribution
+                    lane_acc.accumulate(log_Ylm, sign_Ylm,
+                                        Gm_north_log_re[idx], Gm_north_sign_re[idx],
+                                        Gm_north_log_im[idx], Gm_north_sign_im[idx],
+                                        log_pix_area);
+
+                    // South contribution: Y_l^m(pi-theta) = (-1)^(l+m) * Y_l^m(theta)
+                    int8_t south_sign = ((l + m) & 1) ? -sign_Ylm : sign_Ylm;
+                    lane_acc.accumulate(log_Ylm, south_sign,
+                                        Gm_south_log_re[idx], Gm_south_sign_re[idx],
+                                        Gm_south_log_im[idx], Gm_south_sign_im[idx],
+                                        log_pix_area);
                 }
+
+                // Warp reduce for this l
+                warp_reduce_log_accum(&lane_acc);
+
+                // Lane 0 merges into shared accumulator
+                if (lane == 0) {
+                    sh_accum[l - m].merge(lane_acc);
+                }
+                __syncwarp();
             }
+        }
 
-            // Warp reduce
-            warp_reduce_log_accum(&acc);
-
-            // Lane 0 writes result
-            if (lane == 0) {
-                T* alm_re_t = alm_out_re + (size_t)map_idx * lp1 * lp1;
-                T* alm_im_t = alm_out_im + (size_t)map_idx * lp1 * lp1;
-                acc.store(&alm_re_t[l * lp1 + m], &alm_im_t[l * lp1 + m]);
+        // Write results
+        if (lane == 0) {
+            T* alm_re_t = alm_out_re + (size_t)map_idx * lp1 * lp1;
+            T* alm_im_t = alm_out_im + (size_t)map_idx * lp1 * lp1;
+            for (int l = m; l <= l_max; l++) {
+                sh_accum[l - m].store(&alm_re_t[l * lp1 + m], &alm_im_t[l * lp1 + m]);
             }
         }
     }
@@ -499,7 +491,6 @@ void map2alm_cuda_v6_log_impl(
     // Phase 1: Compute Gm using DFT (reuse from LINEAR mode)
     // ================================================================
 
-    // Use the DFT kernel directly
     int block_size = min(256, lp1);
     compute_gm_kernel_v6<T, R><<<n_north_rings, block_size>>>(
         nside, l_max, n_maps, n_rings, map_in,
@@ -559,9 +550,11 @@ void map2alm_cuda_v6_log_impl(
     R pix_area = R(4.0 * M_PI / (12.0 * nside * nside));
     R log_pix_area = log(pix_area);
 
-    size_t smem_size = 2 * LOG_RING_BATCH_SIZE * sizeof(R);
+    // Shared memory: geometry + accumulators
+    size_t smem_size = 2 * LOG_RING_BATCH_SIZE * sizeof(R) +
+                       (l_max + 1) * sizeof(LogAlmAccumulator<R>);
 
-    reduce_to_alm_log_kernel<T, R><<<lp1, 32, smem_size>>>(
+    reduce_to_alm_log_kernel_v2<T, R><<<lp1, 32, smem_size>>>(
         nside, l_max, n_maps, n_north_rings,
         ws.Gm_north_log_re, ws.Gm_north_log_im,
         ws.Gm_north_sign_re, ws.Gm_north_sign_im,
