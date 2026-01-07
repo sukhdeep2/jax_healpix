@@ -38,12 +38,62 @@ enum class Phase1Method {
 // External reference to global flag from map2alm_v6.cu
 extern Phase1Method g_phase1_method;
 
-// Maximum rings per lane (same as map2alm_v6)
-#define MAX_RINGS_PER_LANE 256
+// Legacy constant for backwards compatibility (used by non-templated code)
+#define MAX_RINGS_PER_LANE 64
 
 // Ring batch size for Phase 1 (undef to override default from spht_types.h)
 #undef RING_BATCH_SIZE
 #define RING_BATCH_SIZE 256
+
+// ============================================================================
+// Memory budget for kernel configuration (alm2map)
+// ============================================================================
+
+// Target: ~1.5KB per thread to avoid spilling to local memory
+static constexpr int MEMORY_BUDGET_BYTES_ALM2MAP = 1536;
+
+// Overhead per thread (loop counters, temporaries, etc.)
+static constexpr int OVERHEAD_BYTES_ALM2MAP = 128;
+
+// Configuration for dynamically selecting kernel template size
+struct KernelConfigAlm2map {
+    int rings_per_lane;     // Template parameter to use (16, 32, 64, or 128)
+    int n_ring_passes;      // Number of passes to cover all rings
+};
+
+// Calculate optimal kernel configuration for alm2map
+template<typename R>
+KernelConfigAlm2map calculate_kernel_config_alm2map(int nside) {
+    // alm2map per-ring arrays:
+    // log_Ylm_prev1, log_Ylm_prev2 (2 × sizeof(R))
+    // sign_prev1, sign_prev2 (2 × int8_t)
+    // log_sin_th_cached, log_cos_th_cached (2 × sizeof(R))
+    // sign_cos_th_cached (1 × int8_t)
+    // log_Ymm_cached (1 × sizeof(R))
+    // sign_Ymm_cached (1 × int8_t)
+    // Total: 6 × sizeof(R) + 4 bytes per ring
+    int per_ring = 6 * sizeof(R) + 4;
+
+    int available = MEMORY_BUDGET_BYTES_ALM2MAP - OVERHEAD_BYTES_ALM2MAP;
+    int max_rings_per_lane = available / per_ring;
+
+    // Select template size (must be power of 2, pick smallest that fits)
+    int template_size;
+    if (max_rings_per_lane >= 128) template_size = 128;
+    else if (max_rings_per_lane >= 64) template_size = 64;
+    else if (max_rings_per_lane >= 32) template_size = 32;
+    else template_size = 16;
+
+    // Calculate rings needed and passes required
+    int n_north_rings = 2 * nside;
+    int rings_needed_per_lane = (n_north_rings + 31) / 32;
+    int n_ring_passes = (rings_needed_per_lane + template_size - 1) / template_size;
+
+    KernelConfigAlm2map config;
+    config.rings_per_lane = template_size;
+    config.n_ring_passes = n_ring_passes;
+    return config;
+}
 
 // ============================================================================
 // Type traits for multi-precision support (shared with map2alm_v6)
@@ -151,10 +201,11 @@ __device__ __forceinline__ void compute_ring_geom_synth_v6(
 // Ylm is computed once and reused across all maps
 // ============================================================================
 
-template<typename T, typename R>
+template<typename T, typename R, bool USE_PRECOMPUTED_COEFF, int RINGS_PER_LANE>
 __global__ void compute_fmy_kernel_v6(
     int nside, int l_max, int n_maps, int n_north_rings,
     int ring_batch_size,
+    int ring_pass, int total_ring_passes,  // Multi-pass ring processing
     const T* __restrict__ alm_real,  // [n_maps, lp1, lp1]
     const T* __restrict__ alm_imag,
     R* __restrict__ Fmy_even_re,     // [n_maps, lp1, n_north_rings]
@@ -178,26 +229,52 @@ __global__ void compute_fmy_kernel_v6(
     C m2_precomp = C(m * m);
     C recur_c_m1 = Traits::sqrt_d(C(2*m + 3));  // For l = m+1 recurrence
 
-    // Shared memory for ring geometry and alm (loaded per batch)
+    // Shared memory layout depends on USE_PRECOMPUTED_COEFF
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
-    // alm values for this m (all l values, shared across lanes)
     T* sh_alm_re = (T*)(sh_sin_th + ring_batch_size);
     T* sh_alm_im = sh_alm_re + lp1;
+    // Precomputed recurrence coefficients (only if USE_PRECOMPUTED_COEFF)
+    C* sh_log_A = USE_PRECOMPUTED_COEFF ? (C*)(sh_alm_im + lp1) : nullptr;
+    C* sh_log_B = USE_PRECOMPUTED_COEFF ? (sh_log_A + lp1) : nullptr;
 
     // Per-lane Ylm recurrence state in LOG-SPACE
     // We store log(|Ylm|) and sign separately for numerical stability
-    C log_Ylm_prev1[MAX_RINGS_PER_LANE];
-    C log_Ylm_prev2[MAX_RINGS_PER_LANE];
-    int8_t sign_prev1[MAX_RINGS_PER_LANE];
-    int8_t sign_prev2[MAX_RINGS_PER_LANE];
+    // Array sizes determined by template parameter RINGS_PER_LANE
+    C log_Ylm_prev1[RINGS_PER_LANE];
+    C log_Ylm_prev2[RINGS_PER_LANE];
+    int8_t sign_prev1[RINGS_PER_LANE];
+    int8_t sign_prev2[RINGS_PER_LANE];
+    // Cached per-ring values to avoid recomputing for each map
+    C log_sin_th_cached[RINGS_PER_LANE];
+    C log_cos_th_cached[RINGS_PER_LANE];
+    int8_t sign_cos_th_cached[RINGS_PER_LANE];
+    C log_Ymm_cached[RINGS_PER_LANE];
+    int8_t sign_Ymm_cached[RINGS_PER_LANE];
 
     // Log-space traits
     using LogTraits = LogArithmeticTraits<C>;
 
-    // Determine global ring indices this lane handles
+    // Precompute m-dependent constants ONCE (not per batch)
+    const C log_prefact = compute_log_prefact_ymm<C>(m);
+    const C log_norm = -C(0.5) * LogTraits::log_d(C(4.0) * LogTraits::PI_VAL);
+    const C log_recur_C_m1 = C(0.5) * LogTraits::log_d(C(2*m + 3));  // For l = m+1
+
+    // Multi-pass ring processing: compute ring range for this pass
+    // k ranges from 0 to n_my_rings_per_pass-1, where each k corresponds to global ring lane + 32*k
     int n_my_rings_total = (n_north_rings + 31 - lane) / 32;
+    int k_offset = ring_pass * RINGS_PER_LANE;
+    int k_max_this_pass = min(n_my_rings_total - k_offset, RINGS_PER_LANE);
+
+    // Precompute recurrence coefficients for this m (only if enabled)
+    if (USE_PRECOMPUTED_COEFF) {
+        for (int l = m + 2 + lane; l <= l_max; l += 32) {
+            sh_log_A[l] = log_A_lm<C>(l, m);
+            sh_log_B[l] = log_B_lm<C>(l, m);
+        }
+        __syncwarp();
+    }
 
     // Process ring batches
     for (int batch_start = 0; batch_start < n_north_rings; batch_start += ring_batch_size) {
@@ -231,25 +308,35 @@ __global__ void compute_fmy_kernel_v6(
             }
         }
 
-        // Determine which rings this lane handles in this batch
-        int k_start = (batch_start > lane) ? (batch_start - lane + 31) / 32 : 0;
-        int k_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
-        k_end = min(k_end, n_my_rings_total);
+        // Determine which rings this lane handles in this batch (accounting for ring_pass)
+        // k values for this pass range from k_offset to k_offset + k_max_this_pass - 1
+        int k_batch_start = (batch_start > lane) ? (batch_start - lane + 31) / 32 : 0;
+        int k_batch_end = (batch_end > lane) ? (batch_end - 1 - lane) / 32 + 1 : 0;
+        // Intersect batch range with ring_pass range, then shift to 0-based for local arrays
+        int k_start = max(k_batch_start, k_offset) - k_offset;
+        int k_end = min(k_batch_end, k_offset + k_max_this_pass) - k_offset;
+        k_start = max(k_start, 0);
+        k_end = max(k_end, 0);
 
         // Initialize Y[m,m] in LOG-SPACE for rings in this batch
-        // Reference: jax_healpix/YLM_jax_log.py sYLM_ll0_log()
-        C log_prefact = compute_log_prefact_ymm<C>(m);
-        C log_norm = -C(0.5) * LogTraits::log_d(C(4.0) * LogTraits::PI_VAL);
-
         for (int k = k_start; k < k_end; k++) {
-            int global_r = lane + 32 * k;
+            int global_r = lane + 32 * (k + k_offset);
             int local_r = global_r - batch_start;
             C sin_th = C(sh_sin_th[local_r]);
+            C cos_th = C(sh_cos_th[local_r]);
+
+            // Cache per-ring log values (reused across all maps)
+            C log_sin_th = safe_log_typed<C>(sin_th);
+            C log_cos_th = safe_log_typed<C>(cos_th);
+            log_sin_th_cached[k] = log_sin_th;
+            log_cos_th_cached[k] = log_cos_th;
+            sign_cos_th_cached[k] = (cos_th >= C(0)) ? int8_t(1) : int8_t(-1);
 
             // Y[m,m] = (-1)^m * sin(th)^m * prefact / sqrt(4*pi)
-            C log_sin_th = safe_log_typed<C>(sin_th);
             C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
             int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);  // (-1)^m
+            log_Ymm_cached[k] = log_Ymm;
+            sign_Ymm_cached[k] = sign_Ymm;
 
             log_Ylm_prev1[k] = log_Ymm;
             sign_prev1[k] = sign_Ymm;
@@ -275,29 +362,21 @@ __global__ void compute_fmy_kernel_v6(
             // For each ring this lane handles, compute Fmy = sum_l(alm * Ylm)
             // Using LOG-SPACE Ylm recurrence for numerical stability
             for (int k = k_start; k < k_end; k++) {
-                int global_r = lane + 32 * k;
+                int global_r = lane + 32 * (k + k_offset);
                 int local_r = global_r - batch_start;
-                C cos_th = C(sh_cos_th[local_r]);
-                C sin_th = C(sh_sin_th[local_r]);
-                C log_cos_th = safe_log_typed<C>(cos_th);
-                int8_t sign_cos_th = (cos_th >= C(0)) ? int8_t(1) : int8_t(-1);
+                // Use cached log values (computed once per ring in batch init)
+                C log_cos_th = log_cos_th_cached[k];
+                int8_t sign_cos_th = sign_cos_th_cached[k];
 
                 // Accumulate Fmy for north and south rings
                 C fmy_n_re = C(0), fmy_n_im = C(0);
                 C fmy_s_re = C(0), fmy_s_im = C(0);
 
-                // Reset log-space Ylm state to initial Y[m,m] values
-                C log_sin_th = safe_log_typed<C>(sin_th);
-                C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
-                int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);
-
-                C log_Ylm_p1 = log_Ymm;
-                int8_t sign_p1 = sign_Ymm;
+                // Use cached Y[m,m] values
+                C log_Ylm_p1 = log_Ymm_cached[k];
+                int8_t sign_p1 = sign_Ymm_cached[k];
                 C log_Ylm_p2 = LogTraits::LOG_MIN;
                 int8_t sign_p2 = 0;
-
-                // Log-space recurrence coefficient for l = m+1
-                C log_recur_C = C(0.5) * LogTraits::log_d(C(2*m + 3));
 
                 // Ylm recurrence and accumulation
                 for (int l = m; l <= l_max; l++) {
@@ -305,11 +384,11 @@ __global__ void compute_fmy_kernel_v6(
                     int8_t sign_Ylm;
 
                     if (l == m) {
-                        log_Ylm = log_Ymm;
-                        sign_Ylm = sign_Ymm;
+                        log_Ylm = log_Ymm_cached[k];
+                        sign_Ylm = sign_Ymm_cached[k];
                     } else if (l == m + 1) {
                         // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
-                        log_Ylm = log_cos_th + log_recur_C + log_Ylm_p1;
+                        log_Ylm = log_cos_th + log_recur_C_m1 + log_Ylm_p1;
                         sign_Ylm = sign_cos_th * sign_p1;
 
                         log_Ylm_p2 = log_Ylm_p1;
@@ -318,15 +397,14 @@ __global__ void compute_fmy_kernel_v6(
                         sign_p1 = sign_Ylm;
                     } else {
                         // Y[l,m] = A*cos_th*Y[l-1,m] - B*Y[l-2,m]
-                        C log_A = log_A_lm<C>(l, m);
-                        C log_B = log_B_lm<C>(l, m);
-
+                        C log_A = USE_PRECOMPUTED_COEFF ? sh_log_A[l] : log_A_lm<C>(l, m);
+                        C log_B = USE_PRECOMPUTED_COEFF ? sh_log_B[l] : log_B_lm<C>(l, m);
                         C R1 = log_A + log_cos_th + log_Ylm_p1;
                         int8_t S1 = sign_cos_th * sign_p1;
                         C R2 = log_B + log_Ylm_p2;
                         int8_t S2 = -sign_p2;  // Negative due to subtraction
 
-                        logsumexp_typed<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
+                        logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
 
                         log_Ylm_p2 = log_Ylm_p1;
                         sign_p2 = sign_p1;
@@ -335,7 +413,8 @@ __global__ void compute_fmy_kernel_v6(
                     }
 
                     // Convert to LINEAR for alm * Ylm multiplication
-                    C Ylm = sign_Ylm * LogTraits::exp_d(clamp_log_typed<C>(log_Ylm));
+                    // Note: clamp removed - exp handles overflow/underflow gracefully
+                    C Ylm = sign_Ylm * LogTraits::exp_d(log_Ylm);
 
                     // alm * Ylm contribution
                     C alm_re = C(sh_alm_re[l]);
@@ -949,13 +1028,8 @@ void alm2map_cuda_v6_impl(
     int lp1 = l_max + 1;
     int max_pix = 4 * nside;
 
-    // Check limits
-    int rings_per_lane = (n_north_rings + 31) / 32;
-    if (rings_per_lane > MAX_RINGS_PER_LANE) {
-        fprintf(stderr, "Error: nside=%d requires %d rings per lane, max is %d\n",
-                nside, rings_per_lane, MAX_RINGS_PER_LANE);
-        return;
-    }
+    // Calculate optimal kernel configuration
+    KernelConfigAlm2map config = calculate_kernel_config_alm2map<R>(nside);
 
     // Timing events
     static bool timing_enabled = (getenv("SPHT_TIMING") != nullptr);
@@ -1004,20 +1078,66 @@ void alm2map_cuda_v6_impl(
     CUDA_CHECK(cudaMalloc(&sin_theta, geom_size));
 
     // Phase 1: Compute Fmy = sum_l(alm * Ylm)
-    int ring_batch_size = RING_BATCH_SIZE;
+    // Shared memory: geometry (2 arrays) + alm (2 arrays) + optional coefficients (2 arrays)
+    // Must fit in 48KB (49152 bytes)
+    const size_t MAX_SMEM = 48 * 1024;
+    size_t base_smem = 2 * lp1 * sizeof(T);  // alm arrays (always needed)
+    size_t coeff_smem = 2 * lp1 * sizeof(R);  // coefficient arrays (optional)
 
-    // Shared memory: geometry (2 arrays) + alm (2 arrays)
-    size_t smem_p1 = 2 * ring_batch_size * sizeof(R) + 2 * lp1 * sizeof(T);
+    // Check if we can fit coefficients
+    bool use_precomputed = (base_smem + coeff_smem + 2 * RING_BATCH_SIZE * sizeof(R)) <= MAX_SMEM;
 
-    // One block per m, 32 threads (one warp)
-    compute_fmy_kernel_v6<T, R><<<lp1, 32, smem_p1>>>(
-        nside, l_max, n_maps, n_north_rings,
-        ring_batch_size,
-        alm_scaled_real, alm_scaled_imag,
-        Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im,
-        cos_theta, sin_theta
-    );
-    CUDA_CHECK(cudaGetLastError());
+    int ring_batch_size;
+    size_t smem_p1;
+    if (use_precomputed) {
+        // Fit coefficients, use standard ring batch size
+        ring_batch_size = RING_BATCH_SIZE;
+        smem_p1 = 2 * ring_batch_size * sizeof(R) + base_smem + coeff_smem;
+    } else {
+        // No room for coefficients, maximize ring batch size
+        size_t avail = MAX_SMEM - base_smem;
+        ring_batch_size = max(8, min((int)(avail / (2 * sizeof(R))), RING_BATCH_SIZE));
+        smem_p1 = 2 * ring_batch_size * sizeof(R) + base_smem;
+    }
+
+    // Dispatch macro for kernel launch with template instantiation
+    #define DISPATCH_FMY_KERNEL(RINGS_PER_LANE_VAL, USE_PRECOMP) \
+        compute_fmy_kernel_v6<T, R, USE_PRECOMP, RINGS_PER_LANE_VAL><<<lp1, 32, smem_p1>>>( \
+            nside, l_max, n_maps, n_north_rings, \
+            ring_batch_size, \
+            ring_pass, config.n_ring_passes, \
+            alm_scaled_real, alm_scaled_imag, \
+            Fmy_even_re, Fmy_even_im, Fmy_odd_re, Fmy_odd_im, \
+            cos_theta, sin_theta \
+        )
+
+    // Multi-pass ring processing loop
+    for (int ring_pass = 0; ring_pass < config.n_ring_passes; ring_pass++) {
+        if (use_precomputed) {
+            switch (config.rings_per_lane) {
+                case 16:  DISPATCH_FMY_KERNEL(16, true);  break;
+                case 32:  DISPATCH_FMY_KERNEL(32, true);  break;
+                case 64:  DISPATCH_FMY_KERNEL(64, true);  break;
+                case 128: DISPATCH_FMY_KERNEL(128, true); break;
+                default:
+                    fprintf(stderr, "Error: Unsupported rings_per_lane=%d\n", config.rings_per_lane);
+                    return;
+            }
+        } else {
+            switch (config.rings_per_lane) {
+                case 16:  DISPATCH_FMY_KERNEL(16, false);  break;
+                case 32:  DISPATCH_FMY_KERNEL(32, false);  break;
+                case 64:  DISPATCH_FMY_KERNEL(64, false);  break;
+                case 128: DISPATCH_FMY_KERNEL(128, false); break;
+                default:
+                    fprintf(stderr, "Error: Unsupported rings_per_lane=%d\n", config.rings_per_lane);
+                    return;
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    #undef DISPATCH_FMY_KERNEL
 
     if (timing_enabled) {
         cudaEventRecord(end_p1);
@@ -1232,6 +1352,51 @@ void alm2map_cuda_v6_impl(
     cudaFree(cos_theta);
     cudaFree(sin_theta);
 }
+
+// ============================================================================
+// Explicit template instantiations for compute_fmy_kernel_v6
+// Each combination: T (storage), R (recurrence), USE_PRECOMPUTED, RINGS_PER_LANE
+// ============================================================================
+
+// Double storage, double recurrence
+template __global__ void compute_fmy_kernel_v6<double, double, true, 16>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 32>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 64>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, true, 128>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 16>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 32>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 64>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<double, double, false, 128>(int, int, int, int, int, int, int, const double*, const double*, double*, double*, double*, double*, double*, double*);
+
+// Double storage, float recurrence
+template __global__ void compute_fmy_kernel_v6<double, float, true, 16>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 32>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 64>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, true, 128>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 16>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 32>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 64>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<double, float, false, 128>(int, int, int, int, int, int, int, const double*, const double*, float*, float*, float*, float*, float*, float*);
+
+// Float storage, double recurrence
+template __global__ void compute_fmy_kernel_v6<float, double, true, 16>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 32>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 64>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, true, 128>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 16>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 32>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 64>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+template __global__ void compute_fmy_kernel_v6<float, double, false, 128>(int, int, int, int, int, int, int, const float*, const float*, double*, double*, double*, double*, double*, double*);
+
+// Float storage, float recurrence
+template __global__ void compute_fmy_kernel_v6<float, float, true, 16>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 32>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 64>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, true, 128>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 16>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 32>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 64>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
+template __global__ void compute_fmy_kernel_v6<float, float, false, 128>(int, int, int, int, int, int, int, const float*, const float*, float*, float*, float*, float*, float*, float*);
 
 // ============================================================================
 // C API entry points

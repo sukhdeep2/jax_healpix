@@ -32,11 +32,12 @@ struct LogArithmeticTraits<float> {
     static constexpr float LOG_4PI_VAL = 2.53102425f;
     static constexpr float PI_VAL = 3.14159265f;
 
-    static __device__ __forceinline__ float log_d(float x) { return logf(x); }
-    static __device__ __forceinline__ float exp_d(float x) { return expf(x); }
-    static __device__ __forceinline__ float log1p_d(float x) { return log1pf(x); }
+    // Use fast intrinsics for maximum performance
+    static __device__ __forceinline__ float log_d(float x) { return __logf(x); }
+    static __device__ __forceinline__ float exp_d(float x) { return __expf(x); }
+    static __device__ __forceinline__ float log1p_d(float x) { return __logf(1.0f + x); }
     static __device__ __forceinline__ float abs_d(float x) { return fabsf(x); }
-    static __device__ __forceinline__ float sqrt_d(float x) { return sqrtf(x); }
+    static __device__ __forceinline__ float sqrt_d(float x) { return __fsqrt_rn(x); }
 };
 
 /**
@@ -192,22 +193,65 @@ C log_B_lm(int l, int m) {
 }
 
 /**
+ * Branchless logsumexp for Ylm recurrence: log(A - B) where A > 0, B > 0
+ *
+ * In Ylm recurrence: result = A*cos*Y_{l-1} - B*Y_{l-2}
+ * We have: R1 = log|term1|, S1 = sign(term1), R2 = log|term2|, S2 = -sign(term2)
+ *
+ * This version avoids branches using select operations.
+ */
+template<typename C>
+__device__ __forceinline__
+void logsumexp_fast(C R1, C R2, int8_t S1, int8_t S2,
+                    C* log_result, int8_t* sign_result) {
+    using Traits = LogArithmeticTraits<C>;
+
+    // Branchless max/min selection
+    bool r1_larger = R1 >= R2;
+    C max_log = r1_larger ? R1 : R2;
+    C min_log = r1_larger ? R2 : R1;
+    int8_t max_sign = r1_larger ? S1 : S2;
+
+    C delta = min_log - max_log;
+    int rel_sign = S1 * S2;
+
+    // For very small delta, just return max
+    // Use branchless: result = max_log + log1p(rel_sign * exp(delta)) if delta > LOG_MIN else max_log
+    C exp_delta = Traits::exp_d(delta);
+    C log1p_term = Traits::log_d(C(1) + C(rel_sign) * exp_delta);
+
+    // Branchless select: if delta < LOG_MIN, use 0 for log1p_term
+    bool use_log1p = delta >= Traits::LOG_MIN;
+    *log_result = max_log + (use_log1p ? log1p_term : C(0));
+
+    // Sign: if same signs -> that sign, else larger magnitude's sign
+    *sign_result = (S1 == S2) ? S1 : max_sign;
+}
+
+/**
  * Compute cumulative log prefactor for Y[m,m] initialization
  *
  * Reference: jax_healpix/YLM_jax_log.py lines 39-42
  *
  * prefact[m] = prod_{j=1}^{m} sqrt((2j+1)/(2j))
- * log_prefact = 0.5 * sum_{j=1}^{m} [log(2j+1) - log(2j)]
+ *
+ * Using lgamma for O(1) computation instead of O(m) loop:
+ * prefact = sqrt((2m+1)!! / (2m)!!) = sqrt((2m+1)! / (2^{2m} * (m!)^2))
+ * log_prefact = 0.5 * [lgamma(2m+2) - 2m*log(2) - 2*lgamma(m+1)]
  */
 template<typename C>
 __device__ __forceinline__
 C compute_log_prefact_ymm(int m) {
     using Traits = LogArithmeticTraits<C>;
-    C log_prefact = C(0);
-    for (int j = 1; j <= m; j++) {
-        log_prefact += C(0.5) * (Traits::log_d(C(2*j + 1)) - Traits::log_d(C(2*j)));
-    }
-    return log_prefact;
+    if (m == 0) return C(0);
+
+    // Use lgamma for O(1) instead of O(m) loop
+    C m_c = C(m);
+    C lgamma_2m2 = lgamma(C(2) * m_c + C(2));  // lgamma(2m+2)
+    C lgamma_m1 = lgamma(m_c + C(1));           // lgamma(m+1)
+    C log2 = C(0.6931471805599453);             // log(2)
+
+    return C(0.5) * (lgamma_2m2 - C(2) * m_c * log2 - C(2) * lgamma_m1);
 }
 
 // ============================================================================
