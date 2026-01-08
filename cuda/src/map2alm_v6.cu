@@ -1130,8 +1130,7 @@ __global__ void bluestein_extract_gm_kernel_f32(
 
 // ============================================================================
 // Phase 2: Reduce to alm using warp-per-m with ring batching and multi-map
-// Uses sequential north/south loading to halve shared memory per map
-// Ylm is computed once per l and reused for both north and south passes
+// Combined N+S pass: loads both Gm_north and Gm_south, computes Ylm once
 // ============================================================================
 
 // Default ring batch size for v6 - can be reduced for multi-map
@@ -1139,12 +1138,12 @@ __global__ void bluestein_extract_gm_kernel_f32(
 #define RING_BATCH_SIZE 256
 
 // Maximum maps that can be processed in parallel (shared memory limited)
-// Shared mem layout: geometry (2 arrays, shared) + Gm (2 arrays per map for N or S)
-// With sequential N/S loading, we only need 2 Gm arrays per map at a time
-// f64: 2*256*8 + N*2*256*8 <= 48KB -> N <= 11
-// f32: 2*256*4 + N*2*256*4 <= 48KB -> N <= 23
-#define MAX_PARALLEL_MAPS_F64 11
-#define MAX_PARALLEL_MAPS_F32 23
+// Shared mem layout: geometry (2 arrays, shared) + Gm (4 arrays per map for N+S combined)
+// Combined N+S loading requires 4 Gm arrays per map: N_re, N_im, S_re, S_im
+// f64: 2*256*8 + N*4*256*8 <= 48KB -> N <= 5
+// f32: 2*256*4 + N*4*256*4 <= 48KB -> N <= 11
+#define MAX_PARALLEL_MAPS_F64 5
+#define MAX_PARALLEL_MAPS_F32 11
 
 template<typename T, typename R, bool USE_PRECOMPUTED_COEFF, int RINGS_PER_LANE>
 __global__ void reduce_to_alm_kernel_v6(
@@ -1171,17 +1170,17 @@ __global__ void reduce_to_alm_kernel_v6(
 
     if (m > l_max || lane >= 32) return;
 
-    // Shared memory layout (sequential N/S loading):
+    // Shared memory layout (combined N+S loading):
     // - Geometry (shared across maps): cos_theta, sin_theta [2 * ring_batch_size]
     // - Optional coefficients: log_A, log_B [2 * lp1] (if USE_PRECOMPUTED_COEFF)
-    // - Gm per map: only 2 arrays at a time (north OR south) [2 * ring_batch_size each]
+    // - Gm per map: 4 arrays for N+S combined [4 * ring_batch_size each]
     extern __shared__ char smem[];
     R* sh_cos_th = (R*)smem;
     R* sh_sin_th = sh_cos_th + ring_batch_size;
     // Precomputed recurrence coefficients (only if enabled)
     C* sh_log_A = USE_PRECOMPUTED_COEFF ? (C*)(sh_sin_th + ring_batch_size) : nullptr;
     C* sh_log_B = USE_PRECOMPUTED_COEFF ? (sh_log_A + lp1) : nullptr;
-    // Gm arrays for parallel maps
+    // Gm arrays for parallel maps (4 arrays per map: N_re, N_im, S_re, S_im)
     R* sh_Gm_base = USE_PRECOMPUTED_COEFF ? (R*)(sh_log_B + lp1) : (R*)(sh_sin_th + ring_batch_size);
 
     // Per-lane Ylm recurrence state in LOG-SPACE (local memory, L1 cached)
@@ -1191,9 +1190,7 @@ __global__ void reduce_to_alm_kernel_v6(
     C log_Ylm_prev2[RINGS_PER_LANE];
     int8_t sign_prev1[RINGS_PER_LANE];
     int8_t sign_prev2[RINGS_PER_LANE];
-    // Save initial Ymm for restoring between north/south passes
-    C log_Ymm_saved[RINGS_PER_LANE];
-    int8_t sign_Ymm_saved[RINGS_PER_LANE];
+    // Note: log_Ymm_saved removed - no longer needed with combined N+S pass
     // Precomputed log(|cos_th|) and sign for each ring (avoid recomputing in l-loop)
     C log_cos_th_cached[RINGS_PER_LANE];
     int8_t sign_cos_th_cached[RINGS_PER_LANE];
@@ -1256,7 +1253,7 @@ __global__ void reduce_to_alm_kernel_v6(
             k_start = max(k_start, 0);
             k_end = max(k_end, 0);
 
-            // Compute and save initial Y[m,m] in LOG-SPACE for rings in this batch
+            // Compute initial Y[m,m] in LOG-SPACE for rings in this batch
             // Reference: jax_healpix/YLM_jax_log.py sYLM_ll0_log() lines 29-62
             for (int k = k_start; k < k_end; k++) {
                 int global_r = lane + 32 * (k + ring_lane_start);
@@ -1274,8 +1271,7 @@ __global__ void reduce_to_alm_kernel_v6(
                 C log_Ymm = C(m) * log_sin_th + log_prefact + log_norm;
                 int8_t sign_Ymm = ((m & 1) == 0) ? int8_t(1) : int8_t(-1);  // (-1)^m
 
-                log_Ymm_saved[k] = log_Ymm;  // Save for south pass
-                sign_Ymm_saved[k] = sign_Ymm;
+                // No need to save for south pass - combined N+S in single loop
                 log_Ylm_prev1[k] = log_Ymm;
                 sign_prev1[k] = sign_Ymm;
                 log_Ylm_prev2[k] = LogTraits::LOG_MIN;  // Zero in log-space
@@ -1283,27 +1279,33 @@ __global__ void reduce_to_alm_kernel_v6(
             }
 
             // ================================================================
-            // NORTH PASS: Load Gm_north, accumulate
+            // COMBINED N+S PASS: Load both Gm_north and Gm_south, process together
             // ================================================================
             for (int t = 0; t < n_maps_in_batch; t++) {
                 int global_t = map_batch_start + t;
                 size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
-                R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;  // 2 arrays per map
+                R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;  // 4 arrays per map
 
                 for (int r = lane; r < batch_size; r += 32) {
                     size_t idx = base_idx + batch_start + r;
                     sh_Gm_t[0 * ring_batch_size + r] = Gm_north_re[idx];
                     sh_Gm_t[1 * ring_batch_size + r] = Gm_north_im[idx];
+                    sh_Gm_t[2 * ring_batch_size + r] = Gm_south_re[idx];
+                    sh_Gm_t[3 * ring_batch_size + r] = Gm_south_im[idx];
                 }
             }
             __syncwarp();
 
-            // Process l = m to l_max for north pass (LOG-SPACE recurrence)
+            // Process l = m to l_max - COMBINED N+S in single loop
+            // Ylm computed once, used for both hemispheres with parity
             for (int l = m; l <= l_max; l++) {
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     sum_re[t] = C(0);
                     sum_im[t] = C(0);
                 }
+
+                // Parity for south hemisphere: (-1)^(l+m)
+                C parity_sign = ((l + m) & 1) ? C(-1) : C(1);
 
                 for (int k = k_start; k < k_end; k++) {
                     int global_r = lane + 32 * (k + ring_lane_start);
@@ -1321,7 +1323,6 @@ __global__ void reduce_to_alm_kernel_v6(
                         sign_Ylm = sign_prev1[k];
                     } else if (l == m + 1) {
                         // Y[m+1,m] = cos_th * sqrt(2m+3) * Y[m,m]
-                        // log|Y[m+1,m]| = log|cos_th| + log_recur_C_m1 + log|Y[m,m]|
                         log_Ylm = log_cos_th + log_recur_C_m1 + log_Ylm_prev1[k];
                         sign_Ylm = sign_cos_th * sign_prev1[k];
 
@@ -1348,19 +1349,24 @@ __global__ void reduce_to_alm_kernel_v6(
                         sign_prev1[k] = sign_Ylm;
                     }
 
-                    // Convert to LINEAR only here for Gm multiplication
+                    // Convert to LINEAR - compute once, use for both N and S
                     C Ylm = sign_Ylm * LogTraits::exp_d(log_Ylm);
+                    C Ylm_south = parity_sign * Ylm;
 
+                    // Accumulate both N and S contributions
                     for (int t = 0; t < n_maps_in_batch; t++) {
-                        R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
-                        C gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
-                        C gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
-                        sum_re[t] += Ylm * gm_re;
-                        sum_im[t] += Ylm * gm_im;
+                        R* sh_Gm_t = sh_Gm_base + t * 4 * ring_batch_size;
+                        C gm_n_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
+                        C gm_n_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
+                        C gm_s_re = C(sh_Gm_t[2 * ring_batch_size + local_r]);
+                        C gm_s_im = C(sh_Gm_t[3 * ring_batch_size + local_r]);
+
+                        sum_re[t] += Ylm * gm_n_re + Ylm_south * gm_s_re;
+                        sum_im[t] += Ylm * gm_n_im + Ylm_south * gm_s_im;
                     }
                 }
 
-                // Warp reduce and output north contribution
+                // Warp reduce and output combined N+S contribution
                 for (int t = 0; t < n_maps_in_batch; t++) {
                     C sr = sum_re[t];
                     C si = sum_im[t];
@@ -1384,112 +1390,6 @@ __global__ void reduce_to_alm_kernel_v6(
                             alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sr * C(pix_area));
                             alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + si * C(pix_area));
                         }
-                    }
-                }
-            }
-
-            // ================================================================
-            // SOUTH PASS: Restore Ylm, load Gm_south, accumulate with sign
-            // ================================================================
-            // Restore Ylm log-space state
-            for (int k = k_start; k < k_end; k++) {
-                log_Ylm_prev1[k] = log_Ymm_saved[k];
-                sign_prev1[k] = sign_Ymm_saved[k];
-                log_Ylm_prev2[k] = LogTraits::LOG_MIN;  // Zero in log-space
-                sign_prev2[k] = 0;
-            }
-
-            // Load Gm_south (reusing same shared memory)
-            for (int t = 0; t < n_maps_in_batch; t++) {
-                int global_t = map_batch_start + t;
-                size_t base_idx = (size_t)global_t * lp1 * n_north_rings + (size_t)m * n_north_rings;
-                R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
-
-                for (int r = lane; r < batch_size; r += 32) {
-                    size_t idx = base_idx + batch_start + r;
-                    sh_Gm_t[0 * ring_batch_size + r] = Gm_south_re[idx];
-                    sh_Gm_t[1 * ring_batch_size + r] = Gm_south_im[idx];
-                }
-            }
-            __syncwarp();
-
-            // Process l = m to l_max for south pass (LOG-SPACE recurrence)
-            for (int l = m; l <= l_max; l++) {
-                for (int t = 0; t < n_maps_in_batch; t++) {
-                    sum_re[t] = C(0);
-                    sum_im[t] = C(0);
-                }
-
-                // Sign for south: +1 if (l+m) even, -1 if odd
-                C parity_sign = ((l + m) & 1) ? C(-1) : C(1);
-
-                for (int k = k_start; k < k_end; k++) {
-                    int global_r = lane + 32 * (k + ring_lane_start);
-                    int local_r = global_r - batch_start;
-                    // Use precomputed log_cos_th (computed once per ring, not per l)
-                    C log_cos_th = log_cos_th_cached[k];
-                    int8_t sign_cos_th = sign_cos_th_cached[k];
-
-                    C log_Ylm;
-                    int8_t sign_Ylm;
-
-                    if (l == m) {
-                        log_Ylm = log_Ylm_prev1[k];
-                        sign_Ylm = sign_prev1[k];
-                    } else if (l == m + 1) {
-                        log_Ylm = log_cos_th + log_recur_C_m1 + log_Ylm_prev1[k];
-                        sign_Ylm = sign_cos_th * sign_prev1[k];
-
-                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
-                        sign_prev2[k] = sign_prev1[k];
-                        log_Ylm_prev1[k] = log_Ylm;
-                        sign_prev1[k] = sign_Ylm;
-                    } else {
-                        C log_A = USE_PRECOMPUTED_COEFF ? sh_log_A[l] : log_A_lm<C>(l, m);
-                        C log_B = USE_PRECOMPUTED_COEFF ? sh_log_B[l] : log_B_lm<C>(l, m);
-                        C R1 = log_A + log_cos_th + log_Ylm_prev1[k];
-                        int8_t S1 = sign_cos_th * sign_prev1[k];
-                        C R2 = log_B + log_Ylm_prev2[k];
-                        int8_t S2 = -sign_prev2[k];
-
-                        logsumexp_fast<C>(R1, R2, S1, S2, &log_Ylm, &sign_Ylm);
-
-                        log_Ylm_prev2[k] = log_Ylm_prev1[k];
-                        sign_prev2[k] = sign_prev1[k];
-                        log_Ylm_prev1[k] = log_Ylm;
-                        sign_prev1[k] = sign_Ylm;
-                    }
-
-                    // Convert to LINEAR with parity sign for south hemisphere
-                    C Ylm = parity_sign * sign_Ylm * LogTraits::exp_d(log_Ylm);
-
-                    for (int t = 0; t < n_maps_in_batch; t++) {
-                        R* sh_Gm_t = sh_Gm_base + t * 2 * ring_batch_size;
-                        C gm_re = C(sh_Gm_t[0 * ring_batch_size + local_r]);
-                        C gm_im = C(sh_Gm_t[1 * ring_batch_size + local_r]);
-                        sum_re[t] += Ylm * gm_re;
-                        sum_im[t] += Ylm * gm_im;
-                    }
-                }
-
-                // Warp reduce and ADD to alm (south contribution)
-                for (int t = 0; t < n_maps_in_batch; t++) {
-                    C sr = sum_re[t];
-                    C si = sum_im[t];
-
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset /= 2) {
-                        sr += __shfl_down_sync(0xffffffff, sr, offset);
-                        si += __shfl_down_sync(0xffffffff, si, offset);
-                    }
-
-                    if (lane == 0) {
-                        int global_t = map_batch_start + t;
-                        T* alm_re_t = alm_out_re + (size_t)global_t * lp1 * lp1;
-                        T* alm_im_t = alm_out_im + (size_t)global_t * lp1 * lp1;
-                        // Always add (north pass already wrote initial value)
-                        alm_re_t[l * lp1 + m] = T(C(alm_re_t[l * lp1 + m]) + sr * C(pix_area));
-                        alm_im_t[l * lp1 + m] = T(C(alm_im_t[l * lp1 + m]) + si * C(pix_area));
                     }
                 }
             }
@@ -1536,11 +1436,11 @@ void compute_v6_params(int n_maps, int* ring_batch_size, int* n_maps_parallel) {
     int batch = RING_BATCH_SIZE;  // 256
 
     // Calculate max parallel maps for default batch size
-    // With sequential N/S loading, we only need 2 Gm arrays per map at a time
-    // Shared mem: geometry (2 arrays) + Gm (2 arrays per map)
-    // smem = 2 * batch * elem + n_par * 2 * batch * elem
-    // n_par = (MAX_SMEM / elem - 2 * batch) / (2 * batch)
-    int max_parallel = (MAX_SMEM / elem_size - 2 * batch) / (2 * batch);
+    // Combined N+S loading requires 4 Gm arrays per map: N_re, N_im, S_re, S_im
+    // Shared mem: geometry (2 arrays) + Gm (4 arrays per map)
+    // smem = 2 * batch * elem + n_par * 4 * batch * elem
+    // n_par = (MAX_SMEM / elem - 2 * batch) / (4 * batch)
+    int max_parallel = (MAX_SMEM / elem_size - 2 * batch) / (4 * batch);
 
     // Cap at compile-time maximum
     if (std::is_same<R, float>::value) {
